@@ -5,6 +5,7 @@
  * They are intentionally pure and dependency free so ranking stays reproducible
  * and testable: the same input always produces the same score.
  */
+import { canonicalTerm, singularizeTerm } from './terminology.ts';
 
 /** Common English words that carry no retrieval signal. Kept small and explicit. */
 const STOPWORDS = new Set([
@@ -16,7 +17,7 @@ const STOPWORDS = new Set([
   'he', 'she', 'them', 'his', 'her', 'their', 'our', 'your', 'my', 'me', 'us',
   'not', 'no', 'nor', 'so', 'too', 'very', 'just', 'also', 'there', 'here', 'when',
   'where', 'which', 'who', 'whom', 'what', 'why', 'how', 'all', 'any', 'both', 'each',
-  'few', 'more', 'most', 'other', 'some', 'such', 'only', 'own', 'same', 'up', 'down',
+  'few', 'more', 'most', 'other', 'some', 'such', 'only', 'same', 'up', 'down',
   'out', 'off', 'again', 'once', 'during', 'before', 'after', 'above', 'below', 'between',
   'because', 'while', 'until', 'per', 'via', 'please', 'need', 'needs', 'want', 'make',
   'makes', 'made', 'get', 'gets', 'got', 'use', 'uses', 'used', 'using', 'work', 'works',
@@ -55,22 +56,20 @@ export function splitWords(input: string): string[] {
 }
 
 /**
- * Lowercase, singularise lightly and drop noise. Used as the canonical form for
- * both indexing-time and query-time term matching, so the two always agree.
+ * Lowercase and singularise lightly, without folding aliases.
+ *
+ * Used where a literal identifier or path segment matters. Semantic retrieval
+ * terms use `canonicalTerm` via `termCounts`/`keywords` instead.
  */
 export function normalizeTerm(token: string): string {
-  let t = token.toLowerCase();
-  if (t.length > 3 && t.endsWith('ies')) t = `${t.slice(0, -3)}y`;
-  else if (t.length > 3 && t.endsWith('ses')) t = t.slice(0, -2);
-  else if (t.length > 3 && t.endsWith('s') && !t.endsWith('ss') && !t.endsWith('us')) t = t.slice(0, -1);
-  return t;
+  return singularizeTerm(token);
 }
 
 /** Tokenise text into normalised, de-duplicated terms with occurrence counts. */
 export function termCounts(input: string): Map<string, number> {
   const counts = new Map<string, number>();
   for (const word of splitWords(input)) {
-    const term = normalizeTerm(word);
+    const term = canonicalTerm(word);
     if (term.length < MIN_TERM_LENGTH) continue;
     if (STOPWORDS.has(term)) continue;
     counts.set(term, (counts.get(term) ?? 0) + 1);
@@ -231,7 +230,7 @@ export function tidy(text: string | null | undefined): string {
 
 /** Nearest match from a list of candidates for a free-text term, or undefined. */
 export function closestMatch(term: string, candidates: readonly string[]): string | undefined {
-  const needle = normalizeTerm(term);
+  const needle = canonicalTerm(term);
   if (!needle) return undefined;
   let best: { value: string; score: number } | undefined;
   for (const candidate of candidates) {

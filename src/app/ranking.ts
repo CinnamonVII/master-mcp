@@ -15,7 +15,7 @@ import type { Clock } from '../util/time.ts';
 import { recencyScore } from '../util/time.ts';
 import { bestPathAffinity, queryCoverage, truncate } from '../util/text.ts';
 import { confidenceRank, priorityWeight, severityWeight } from '../domain/vocabulary.ts';
-import { normalizeTerm } from '../util/text.ts';
+import { canonicalTerm } from '../util/terminology.ts';
 
 /**
  * Signal weights. Tuned so that *specific* evidence (subsystem, files,
@@ -159,7 +159,7 @@ export function scoreItem(item: MemoryItem, context: RelevanceContext): ScoredIt
     let hits = 0;
     const examples: string[] = [];
     for (const identifier of context.identifierTerms) {
-      if (itemTerms.has(normalizeTerm(identifier))) {
+      if (itemTerms.has(canonicalTerm(identifier))) {
         hits += 1;
         if (examples.length < 2) examples.push(identifier);
       }

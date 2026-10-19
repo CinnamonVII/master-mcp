@@ -27,6 +27,7 @@ import type { ProjectConfig } from '../domain/models.ts';
 import type { Clock } from '../util/time.ts';
 import { humanAge, isoNow } from '../util/time.ts';
 import { endSentence, normalizeTerm, truncate } from '../util/text.ts';
+import { canonicalTerm } from '../util/terminology.ts';
 import {
   CONFIDENCE_CRITERIA,
   CONFIDENCE_PROMOTION,
@@ -446,7 +447,7 @@ function selectLikelyFiles(input: {
   // Files named by recent commits that also match the task vocabulary.
   const terms = new Set(input.interpretation.terms);
   for (const file of input.observation?.recentlyChangedFiles ?? []) {
-    const tokens = new Set((file.match(/[A-Za-z0-9_]+/g) ?? []).map(normalizeTerm));
+    const tokens = new Set((file.match(/[A-Za-z0-9_]+/g) ?? []).map(canonicalTerm));
     if ([...terms].some((term) => tokens.has(term))) add(file);
   }
   return out.slice(0, input.caps.likelyFiles);

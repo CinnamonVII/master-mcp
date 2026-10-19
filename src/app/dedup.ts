@@ -12,7 +12,7 @@
  *  - at or above `BORDERLINE_THRESHOLD` the match is only worth a note, so the
  *    caller still creates the record but tells the agent a similar one exists
  */
-import { keywords, normalizeTerm } from '../util/text.ts';
+import { keywords } from '../util/text.ts';
 
 export interface DedupCandidate {
   /** Free text that identifies the record: a statement or a title. */
@@ -46,40 +46,11 @@ export const DUPLICATE_THRESHOLD = 0.8;
 export const BORDERLINE_THRESHOLD = 0.55;
 
 /**
- * Small synonym map for engineering vocabulary. Deliberately tiny: it exists to
- * absorb the abbreviations agents actually type, not to be a thesaurus.
+ * Normalised content terms, with singularisation and vocabulary folding from the
+ * shared terminology table, so dedup agrees with ranking and search.
  */
-const SYNONYMS: Readonly<Record<string, string>> = {
-  tech: 'technology',
-  technologies: 'technology',
-  db: 'database',
-  datasource: 'database',
-  config: 'configuration',
-  cfg: 'configuration',
-  auth: 'authentication',
-  authn: 'authentication',
-  authz: 'authorization',
-  repo: 'repository',
-  perf: 'performance',
-  impl: 'implementation',
-  deps: 'dependency',
-  dependency: 'dependency',
-  env: 'environment',
-  docs: 'documentation',
-  doc: 'documentation',
-  spec: 'specification',
-  ui: 'interface',
-  api: 'interface',
-};
-
-/** Normalised content terms, with light singularisation and synonym folding. */
 export function dedupTerms(text: string): string[] {
-  const out: string[] = [];
-  for (const term of keywords(text.replace(/['’]/g, ''))) {
-    const folded = SYNONYMS[term] ?? SYNONYMS[normalizeTerm(term)] ?? term;
-    if (!out.includes(folded)) out.push(folded);
-  }
-  return out;
+  return keywords(text.replace(/['’]/g, ''));
 }
 
 const NEGATIONS = /\b(not|never|no|without|avoid|avoids|avoided|prohibit|prohibited|forbid|forbidden|must not|cannot|can't|don't|does not|doesn't|isn't|aren't|instead of|rather than)\b/i;

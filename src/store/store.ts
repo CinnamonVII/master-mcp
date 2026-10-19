@@ -32,6 +32,7 @@ import type {
 } from '../domain/models.ts';
 import { confidenceRank } from '../domain/vocabulary.ts';
 import { keywords, truncate } from '../util/text.ts';
+import { termVariants } from '../util/terminology.ts';
 import { newId } from '../util/ids.ts';
 
 /** node:sqlite accepts only these value types; helpers keep callers honest. */
@@ -1366,9 +1367,10 @@ export class Store {
   /**
    * Ranked full-text search.
    *
-   * The FTS query is built from normalised terms so query text and index text
-   * are tokenised identically. Scores are normalised against the best hit so
-   * callers get a scale-free 0..1 relevance that does not depend on corpus size.
+   * Query text is folded into the same canonical terms used by ranking and
+   * dedup, then expanded to the family's surface forms because the index keeps
+   * original prose. Scores are normalised against the best hit so callers get a
+   * scale-free 0..1 relevance that does not depend on corpus size.
    */
   searchMemory(query: MemoryQuery): MemoryHit[] {
     const terms = keywords(query.query);
@@ -1661,12 +1663,21 @@ export class Store {
   }
 }
 
-/** Build an FTS5 MATCH expression from normalised terms (OR of prefixes). */
+/**
+ * Build an FTS5 MATCH expression from canonical retrieval terms.
+ *
+ * Each term expands to its shared terminology family (for example `ownership`
+ * also searches `own`, `owner`, …) because the index keeps the original prose.
+ * The stored documents are never rewritten, so search output stays verbatim.
+ */
 export function buildFtsQuery(terms: readonly string[]): string {
-  const cleaned = terms
-    .map((term) => term.replace(/["*()]/g, '').trim())
-    .filter((term) => term.length > 0)
-    .slice(0, 24);
+  const cleaned: string[] = [];
+  for (const term of terms.slice(0, 24)) {
+    for (const variant of termVariants(term)) {
+      const value = variant.replace(/["*()]/g, '').trim();
+      if (value.length > 0 && !cleaned.includes(value)) cleaned.push(value);
+    }
+  }
   if (cleaned.length === 0) return '""';
   return cleaned.map((term) => `"${term}"`).join(' OR ');
 }

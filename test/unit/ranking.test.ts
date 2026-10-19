@@ -10,6 +10,7 @@ import { strict as assert } from 'node:assert';
 import { describe, it } from 'node:test';
 import type { Bug, MemoryItem } from '../../src/domain/models.ts';
 import { fixedClock } from '../../src/util/time.ts';
+import { keywords } from '../../src/util/text.ts';
 import {
   describeBug,
   rankItems,
@@ -104,6 +105,38 @@ describe('scoreItem', () => {
       context({ terms: new Set(['ownership', 'offer', 'eligibility', 'check']) }),
     );
     assert.ok(scored.score > 0);
+  });
+
+  it('scores the known own/ownership paraphrase through the shared vocabulary', () => {
+    const bugTerms = keywords('Support tooling still shows offers the viewer does not own');
+    const taskTerms = new Set(keywords('Fix the technology ownership regression bug'));
+    assert.ok(bugTerms.includes('ownership'), `expected ownership in ${bugTerms.join(',')}`);
+    const scored = scoreItem(
+      item({
+        id: 'bug_own',
+        title: 'Support tooling still shows offers the viewer does not own',
+        terms: bugTerms,
+        severity: 'low',
+        createdAt: '2020-01-01T00:00:00.000Z',
+      }),
+      context({ terms: taskTerms }),
+    );
+    assert.ok((scored.breakdown['terms'] ?? 0) > 0, 'the ownership terms must overlap');
+  });
+
+  it('does not promote an unrelated owner record from one shared generic term', () => {
+    const scored = scoreItem(
+      item({
+        id: 'bug_owner',
+        title: 'The owner field is nullable in the billing export',
+        terms: keywords('The owner field is nullable in the billing export'),
+        severity: 'low',
+        createdAt: '2020-01-01T00:00:00.000Z',
+      }),
+      context({ terms: new Set(keywords('Fix the technology ownership regression bug')) }),
+    );
+    assert.ok((scored.breakdown['terms'] ?? 0) > 0, 'owner folds to ownership');
+    assert.ok(scored.score < RELEVANCE_THRESHOLD, `expected below threshold, got ${scored.score}`);
   });
 
   it('scores a partial identifier hit above partial prose overlap', () => {

@@ -53,6 +53,24 @@ describe('recordSimilarity', () => {
     assert.ok(withShort.score > withoutSynonyms.score);
     assert.deepEqual(dedupTerms('Auth config'), ['authentication', 'configuration']);
   });
+
+  it('uses the same ownership vocabulary as ranking and search', () => {
+    assert.deepEqual(dedupTerms('The owner owns ownership'), ['ownership']);
+    const result = recordSimilarity(
+      { text: 'The owner owns the offer' },
+      { text: 'Ownership of the offer' },
+    );
+    assert.ok(result.score >= DUPLICATE_THRESHOLD, `expected a duplicate score, got ${result.score}`);
+  });
+
+  it('does not merge unrelated records that merely contain the word owner', () => {
+    const result = recordSimilarity(
+      { text: 'The owner field is nullable in the billing export' },
+      { text: 'Fix the technology ownership regression bug' },
+    );
+    assert.deepEqual(result.shared, ['ownership']);
+    assert.ok(result.score < BORDERLINE_THRESHOLD, `expected a low score, got ${result.score}`);
+  });
 });
 
 describe('findDuplicate', () => {

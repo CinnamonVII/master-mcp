@@ -60,7 +60,13 @@ describe('normalizeTerm', () => {
 describe('keywords', () => {
   it('drops stopwords, normalises and de-duplicates', () => {
     assert.deepEqual(keywords('Fix the incorrect ownership checks in the offer UI'), [
-      'fix', 'incorrect', 'ownership', 'check', 'offer', 'ui',
+      'fix', 'incorrect', 'ownership', 'check', 'offer', 'interface',
+    ]);
+  });
+
+  it('uses the shared terminology table for aliases', () => {
+    assert.deepEqual(keywords('tech repo db config perf impl'), [
+      'technology', 'repository', 'database', 'configuration', 'performance', 'implementation',
     ]);
   });
 

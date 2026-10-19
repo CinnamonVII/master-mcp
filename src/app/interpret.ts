@@ -9,6 +9,7 @@
 import type { Project, Severity, TaskType } from '../domain/models.ts';
 import type { ProjectConfig } from '../domain/models.ts';
 import { keywords, isIdentifierLike, splitWords, normalizeTerm, pathTokens } from '../util/text.ts';
+import { canonicalTerm } from '../util/terminology.ts';
 import { slugify } from '../util/ids.ts';
 
 export type InferenceConfidence = 'high' | 'medium' | 'low';
@@ -242,7 +243,7 @@ export function interpretTask(input: InterpretTaskInput): TaskInterpretation {
       rawTokens(task)
         .filter(isIdentifierLike)
         .flatMap((token) => splitWords(token))
-        .map(normalizeTerm)
+        .map(canonicalTerm)
         .filter((term) => term.length >= 3),
     ),
   ];
