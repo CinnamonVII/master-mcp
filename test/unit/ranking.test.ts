@@ -194,6 +194,22 @@ describe('rankItems', () => {
     assert.equal(ranked[0]?.item.id, 'bug_critical');
   });
 
+  it('orders equal records by effective freshness, then id', () => {
+    const newer = item({ id: 'bug_b', subsystem: 'ownership', createdAt: '2026-02-27T00:00:00.000Z' });
+    const older = item({ id: 'bug_a', subsystem: 'ownership', createdAt: '2026-02-20T00:00:00.000Z' });
+    assert.deepEqual(
+      rankItems([older, newer], context({ subsystems: ['ownership'] })).map((entry) => entry.item.id),
+      ['bug_b', 'bug_a'],
+    );
+
+    const sameTimeA = item({ id: 'bug_a', subsystem: 'ownership', createdAt: '2026-02-27T00:00:00.000Z' });
+    const sameTimeB = item({ id: 'bug_b', subsystem: 'ownership', createdAt: '2026-02-27T00:00:00.000Z' });
+    assert.deepEqual(
+      rankItems([sameTimeB, sameTimeA], context({ subsystems: ['ownership'] })).map((entry) => entry.item.id),
+      ['bug_a', 'bug_b'],
+    );
+  });
+
   it('is deterministic across repeated runs', () => {
     const items = [
       item({ id: 'bug_1', subsystem: 'ownership' }),

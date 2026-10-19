@@ -8,7 +8,19 @@
 import { strict as assert } from 'node:assert';
 import { describe, it } from 'node:test';
 import type { StatusReport } from '../../src/app/status.ts';
-import { defaultMaxTokens, renderBrief, renderStatus } from '../../src/app/render.ts';
+import {
+  ABSOLUTE_MAX_BRIEF_TOKENS,
+  DEEP_MAX_BRIEF_TOKENS,
+  DEFAULT_MAX_BRIEF_TOKENS,
+  MIN_BRIEF_TOKENS,
+  RE_MAX_BRIEF_TOKENS,
+  autoMaxTokens,
+  clampBriefTokens,
+  defaultMaxTokens,
+  renderBrief,
+  renderStatus,
+  resolveBriefBudget,
+} from '../../src/app/render.ts';
 import { approxTokens } from '../../src/util/text.ts';
 import { sampleBrief, hasSection, section } from '../helpers/harness.ts';
 
@@ -145,6 +157,29 @@ describe('renderBrief', () => {
     assert.match(text, /^- npm test$/m);
   });
 
+  it('shows requirement coverage as a compact summary with per-check marks', () => {
+    const brief = sampleBrief({
+      coverage: {
+        status: 'partial',
+        satisfied: 1,
+        total: 3,
+        entries: [
+          { requirement: 'Run `npm test`', kind: 'test', satisfied: true, verificationId: 'ver_1' },
+          { requirement: 'Run `npm run lint`', kind: 'lint', satisfied: false, verificationId: null },
+          { requirement: 'Run `npm run build`', kind: 'build', satisfied: false, verificationId: null },
+        ],
+      },
+    });
+    const block = section(renderBrief(brief), 'VERIFICATION');
+    assert.match(block, /^coverage: 1\/3 · status: partial$/m);
+    assert.match(block, /requirement coverage:\n- ✓ Run `npm test`\n- ✗ Run `npm run lint`\n- ✗ Run `npm run build`/);
+
+    // The one-line summary is part of the section header, so even an
+    // impossibly small budget cannot hide the fact that coverage is partial.
+    const tight = renderBrief(brief, { maxTokens: 1 });
+    assert.match(tight, /coverage: 1\/3 · status: partial/);
+  });
+
   it('gives reverse-engineering and deep briefs a larger default budget', () => {
     const plain = sampleBrief();
     const re = sampleBrief({ task: { ...plain.task, mode: 're' }, reverseEngineering: {
@@ -152,6 +187,43 @@ describe('renderBrief', () => {
     } });
     assert.ok(defaultMaxTokens(re) > defaultMaxTokens(plain));
     assert.equal(defaultMaxTokens(plain), 2000);
+  });
+});
+
+describe('brief budget policy', () => {
+  it('uses 2000/3000/4000 defaults by mode', () => {
+    assert.equal(DEFAULT_MAX_BRIEF_TOKENS, 2000);
+    assert.equal(RE_MAX_BRIEF_TOKENS, 3000);
+    assert.equal(DEEP_MAX_BRIEF_TOKENS, 4000);
+    assert.equal(autoMaxTokens({ mode: 'auto' }), 2000);
+    assert.equal(autoMaxTokens({ mode: 'read_only' }), 2000);
+    assert.equal(autoMaxTokens({ mode: 'deep' }), 4000);
+    assert.equal(autoMaxTokens({ mode: 're' }), 3000);
+    assert.equal(autoMaxTokens({ mode: 'auto', reverseEngineering: true }), 3000);
+  });
+
+  it('prefers the per-call value, then the explicit config value, then the mode', () => {
+    assert.equal(resolveBriefBudget({ mode: 'deep', explicit: 1200 }), 1200);
+    assert.equal(
+      resolveBriefBudget({ mode: 'deep', configured: 2500, configuredExplicitly: true }),
+      2500,
+    );
+    assert.equal(
+      resolveBriefBudget({ mode: 'deep', configured: 2500, configuredExplicitly: false }),
+      4000,
+      'a default config value is not treated as an explicit choice',
+    );
+    assert.equal(resolveBriefBudget({ mode: 'deep' }), 4000);
+  });
+
+  it('clamps explicit values to the documented floor and absolute ceiling', () => {
+    assert.equal(clampBriefTokens(1), MIN_BRIEF_TOKENS);
+    assert.equal(clampBriefTokens(999_999), ABSOLUTE_MAX_BRIEF_TOKENS);
+    assert.equal(resolveBriefBudget({ mode: 'auto', explicit: 999_999 }), ABSOLUTE_MAX_BRIEF_TOKENS);
+    assert.equal(
+      resolveBriefBudget({ mode: 'auto', configured: 999_999, configuredExplicitly: true }),
+      ABSOLUTE_MAX_BRIEF_TOKENS,
+    );
   });
 });
 

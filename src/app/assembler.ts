@@ -38,6 +38,8 @@ import type { ContextMode, InferenceConfidence, TaskInterpretation } from './int
 import { assessRisk } from './interpret.ts';
 import type { RelevanceContext, ScoredItem } from './ranking.ts';
 import { confidenceLabel, describeBug, rankItems, strongestSeverity } from './ranking.ts';
+import { detectDurableConflicts } from './conflicts.ts';
+import { assessRequirements, effectiveRequirements } from './verification.ts';
 
 // ---------------------------------------------------------------------------
 // Brief shape
@@ -142,6 +144,20 @@ export interface BriefVerification {
   age: string;
 }
 
+export interface BriefCoverageEntry {
+  requirement: string;
+  kind: string;
+  satisfied: boolean;
+}
+
+/** Compact requirement coverage for the task this brief is about. */
+export interface BriefCoverage {
+  status: string;
+  satisfied: number;
+  total: number;
+  entries: BriefCoverageEntry[];
+}
+
 export interface BriefFollowUp {
   id: string;
   title: string;
@@ -170,6 +186,8 @@ export interface Brief {
   findings: BriefFinding[];
   attempts: BriefAttempt[];
   verifications: BriefVerification[];
+  /** Requirement coverage for the current task; null when nothing is required. */
+  coverage: BriefCoverage | null;
   likelyFiles: string[];
   /** Files with uncommitted changes, so the renderer can flag them. */
   uncommittedFiles: string[];
@@ -239,6 +257,7 @@ export interface SelectionCaps {
   likelyFiles: number;
   recentCommits: number;
   approach: number;
+  coverage: number;
 }
 
 export const DEFAULT_CAPS: SelectionCaps = {
@@ -252,6 +271,7 @@ export const DEFAULT_CAPS: SelectionCaps = {
   likelyFiles: 10,
   recentCommits: 5,
   approach: 6,
+  coverage: 6,
 };
 
 /** `deep` mode widens the net for investigation-style work. */
@@ -266,6 +286,7 @@ export const DEEP_CAPS: SelectionCaps = {
   followUps: 6,
   likelyFiles: 14,
   recentCommits: 10,
+  coverage: 10,
 };
 
 export function capsForMode(mode: ContextMode): SelectionCaps {
@@ -603,6 +624,46 @@ function buildVerificationPlan(input: {
   return { commands, requirements, manualChecks, regressionAreas, unknown };
 }
 
+/**
+ * Compute the requirement coverage the current task has reached so far.
+ *
+ * Requirements are the task's own when it declared them, otherwise the
+ * configured checks. Only verifications linked to this task count; a fresh task
+ * with no linked evidence reports `none` rather than a misleading partial.
+ */
+function buildCoverage(input: {
+  task: Task | null;
+  config: ProjectConfig;
+  interpretation: TaskInterpretation;
+  items: readonly MemoryItem[];
+  caps: SelectionCaps;
+}): BriefCoverage | null {
+  const requirements = effectiveRequirements({
+    task: input.task,
+    config: input.config,
+    taskType: input.interpretation.taskType,
+  });
+  if (requirements.length === 0) return null;
+
+  const linked = input.items
+    .filter((item) => item.kind === 'verification' && input.task !== null && item.taskId === input.task.id)
+    .map((item) => item.raw as Verification)
+    .sort((a, b) => b.createdAt.localeCompare(a.createdAt))
+    .slice(0, 50);
+
+  const coverage = assessRequirements(requirements, linked);
+  return {
+    status: linked.length === 0 ? 'none' : coverage.status,
+    satisfied: coverage.satisfied,
+    total: coverage.total,
+    entries: coverage.entries.slice(0, input.caps.coverage).map((entry) => ({
+      requirement: truncate(entry.requirement, 90),
+      kind: entry.kind,
+      satisfied: entry.satisfied,
+    })),
+  };
+}
+
 /** Pick the single most valuable first action, and say why. */
 function buildNextAction(input: {
   interpretation: TaskInterpretation;
@@ -810,7 +871,11 @@ export function assembleBrief(input: AssembleBriefInput): Brief {
   const scoredById = new Map(scored.map((entry) => [entry.item.id, entry]));
 
   const bugs = scored.filter((entry) => entry.item.kind === 'bug').slice(0, caps.bugs);
-  const decisions = scored.filter((entry) => entry.item.kind === 'decision').slice(0, caps.decisions);
+  // Only active decisions are live guidance. Superseded ones stay retrievable
+  // through master_search and export, but they must not steer new work.
+  const decisions = scored
+    .filter((entry) => entry.item.kind === 'decision' && entry.item.status === 'active')
+    .slice(0, caps.decisions);
   const findings = scored.filter((entry) => entry.item.kind === 'finding').slice(0, caps.findings);
   const verifications = scored.filter((entry) => entry.item.kind === 'verification').slice(0, caps.verifications);
 
@@ -909,6 +974,26 @@ export function assembleBrief(input: AssembleBriefInput): Brief {
     ...detectConflicts(input, briefAttempts[0] ?? null),
   ];
 
+  // Contradictions between active durable records are more important than the
+  // generic "state moved" warnings, so they are prepended.
+  const durableConflicts = detectDurableConflicts({
+    decisions: byKind(input.items, 'decision').map((item) => item.raw as import('../domain/models.ts').Decision),
+    constraints: byKind(input.items, 'constraint').map((item) => item.raw as Constraint),
+    bugs: byKind(input.items, 'bug').map((item) => item.raw as import('../domain/models.ts').Bug),
+  });
+  if (durableConflicts.length > 0) {
+    warnings.unshift(...durableConflicts.map((conflict) => ({ level: conflict.level, text: conflict.text })));
+    warnings.splice(6);
+  }
+
+  const coverage = buildCoverage({
+    task: input.task,
+    config: input.config,
+    interpretation: input.interpretation,
+    items: input.items,
+    caps,
+  });
+
   const reverseEngineering = buildReverseEngineering({
     items: input.items,
     interpretation: input.interpretation,
@@ -987,6 +1072,7 @@ export function assembleBrief(input: AssembleBriefInput): Brief {
     findings: briefFindings,
     attempts: briefAttempts,
     verifications: briefVerifications,
+    coverage,
     likelyFiles,
     uncommittedFiles: [
       ...(input.observation?.changedFiles ?? []),

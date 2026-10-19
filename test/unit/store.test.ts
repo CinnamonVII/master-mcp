@@ -303,6 +303,24 @@ describe('decisions, constraints, bugs and findings', () => {
     }
   });
 
+  it('links a replaced constraint to its replacement', () => {
+    const f = openFixture();
+    try {
+      const projectId = makeProject(f.store);
+      const old = f.store.createConstraint({ projectId, statement: 'Ownership is inferred in the UI', now: NOW });
+      const next = f.store.createConstraint({ projectId, statement: 'Ownership comes from the offer record', now: LATER });
+
+      const replaced = f.store.replaceConstraint(old.id, next.id, LATER)!;
+      assert.equal(replaced.active, false);
+      assert.equal(replaced.replacedBy, next.id);
+      assert.equal(replaced.updatedAt, LATER);
+      assert.deepEqual(f.store.listConstraints(projectId).map((constraint) => constraint.id), [next.id]);
+      assert.equal(f.store.getConstraint(old.id)?.replacedBy, next.id, 'the historical record keeps its link');
+    } finally {
+      f.cleanup();
+    }
+  });
+
   it('round-trips bugs and applies patches', () => {
     const f = openFixture();
     try {
@@ -401,6 +419,21 @@ describe('verifications and handoffs', () => {
 
       assert.equal(f.store.listVerifications(projectId, { taskId: first.id }).length, 1);
       assert.equal(f.store.listVerifications(projectId).length, 2);
+
+      const linked = f.store.createVerification({
+        projectId,
+        taskId: first.id,
+        method: 'command',
+        command: 'npm test',
+        result: 'pass',
+        evidence: ['ownership regression covered'],
+        requirement: 'Run `npm test`',
+        bugId: 'bug_1a2b3c4d',
+        now: LATER,
+      });
+      assert.equal(linked.requirement, 'Run `npm test`');
+      assert.equal(linked.bugId, 'bug_1a2b3c4d');
+      assert.equal(f.store.getVerification(linked.id)?.requirement, 'Run `npm test`');
 
       f.store.createHandoff({ projectId, taskId: first.id, summary: 'First pass', head: 'a'.repeat(40), now: NOW });
       f.store.createHandoff({
@@ -506,7 +539,77 @@ describe('full-text index', () => {
 });
 
 // ---------------------------------------------------------------------------
-// Database path resolution
+// Freshness
+// ---------------------------------------------------------------------------
+
+describe('freshness ordering', () => {
+  it('uses updatedAt as the effective freshness of mutable records', () => {
+    const f = openFixture();
+    try {
+      const projectId = makeProject(f.store);
+      const decision = f.store.createDecision({
+        projectId,
+        statement: 'Eligibility lives in the offer predicate',
+        now: NOW,
+      });
+      f.store.updateDecision(decision.id, { rationale: 'Revised after review.', now: LATER });
+      const bug = f.store.createBug({
+        projectId,
+        title: 'Ownership check passes for unverified offers',
+        now: NOW,
+      });
+      f.store.updateBug(bug.id, { status: 'investigating', now: LATER });
+      const finding = f.store.createFinding({ projectId, statement: 'The UI caches ownership.', now: NOW });
+      f.store.updateFinding(finding.id, { evidence: ['confirmed in the offer screen'], now: LATER });
+
+      const byId = new Map(f.store.loadMemoryItems(projectId).map((item) => [item.id, item]));
+      assert.equal(byId.get(decision.id)?.createdAt, LATER, 'a decision ages from its last update');
+      assert.equal(byId.get(bug.id)?.createdAt, LATER, 'a bug ages from its last update');
+      assert.equal(byId.get(finding.id)?.createdAt, LATER, 'a finding ages from its last update');
+    } finally {
+      f.cleanup();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Transactions
+// ---------------------------------------------------------------------------
+
+describe('transactions', () => {
+  it('joins nested transactions and rolls the whole unit back on failure', () => {
+    const f = openFixture();
+    try {
+      const projectId = makeProject(f.store);
+      const taskId = f.store.transaction(() => {
+        const task = f.store.createTask({ projectId, title: 'Nested transaction task', now: NOW });
+        f.store.transaction(() => {
+          f.store.updateTask(task.id, { status: 'in_progress', now: NOW });
+        });
+        return task.id;
+      });
+      assert.equal(f.store.getTask(taskId)?.status, 'in_progress');
+
+      assert.throws(
+        () => {
+          f.store.transaction(() => {
+            f.store.updateTask(taskId, { status: 'blocked', now: LATER });
+            f.store.transaction(() => {
+              throw new Error('inner failure');
+            });
+          });
+        },
+        /inner failure/,
+      );
+      assert.equal(f.store.getTask(taskId)?.status, 'in_progress', 'the outer transaction rolled everything back');
+    } finally {
+      f.cleanup();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Database path
 // ---------------------------------------------------------------------------
 
 describe('resolveDatabasePath', () => {
@@ -610,6 +713,132 @@ describe('migrations', () => {
       assert.deepEqual(migrate(db, undefined, migrations).applied, []);
     } finally {
       db.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('creates the version-2 columns on a fresh database', () => {
+    const dir = tempDir('master-mcp-migrate');
+    const path = join(dir, 'memory.sqlite');
+    try {
+      const db = openDatabase({ path, clock: fixedClock(NOW) });
+      const columns = (table: string): string[] =>
+        (db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>).map((row) => row.name);
+      assert.ok(columns('verifications').includes('requirement'));
+      assert.ok(columns('verifications').includes('bug_id'));
+      assert.ok(columns('constraints').includes('replaced_by'));
+      assert.ok(columns('bugs').includes('task_id'));
+      const migrations = (db.prepare('SELECT version, name FROM migrations ORDER BY version').all() as Array<{
+        version: number;
+        name: string;
+      }>).map((row) => `${row.version}:${row.name}`);
+      assert.deepEqual(migrations, [
+        '1:initial_schema',
+        '2:verification_coverage_and_lifecycle',
+      ]);
+      db.close();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('upgrades a populated version-1 database and preserves its data', () => {
+    const dir = tempDir('master-mcp-migrate');
+    const path = join(dir, 'v1.sqlite');
+    try {
+      // Build a real version-1 database by applying only the first migration.
+      const legacy = new DatabaseSync(path);
+      migrate(legacy, fixedClock(NOW), [MIGRATIONS[0]!]);
+      legacy
+        .prepare('INSERT INTO projects (id, slug, name, created_at, updated_at) VALUES (?, ?, ?, ?, ?)')
+        .run('prj_legacy', 'legacy-project', 'Legacy Project', NOW, NOW);
+      legacy
+        .prepare('INSERT INTO constraints (id, project_id, statement, created_at, updated_at) VALUES (?, ?, ?, ?, ?)')
+        .run('con_legacy', 'prj_legacy', 'Never infer ownership in the UI', NOW, NOW);
+      legacy
+        .prepare('INSERT INTO bugs (id, project_id, title, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)')
+        .run('bug_legacy', 'prj_legacy', 'Ownership check passes for unverified offers', 'open', NOW, NOW);
+      legacy
+        .prepare('INSERT INTO verifications (id, project_id, method, command, result, created_at) VALUES (?, ?, ?, ?, ?, ?)')
+        .run('ver_legacy', 'prj_legacy', 'command', 'npm test', 'pass', NOW);
+      legacy.close();
+
+      const upgraded = openDatabase({ path, clock: fixedClock(LATER) });
+      try {
+        assert.equal(schemaVersion(upgraded), LATEST_VERSION);
+
+        const project = upgraded.prepare('SELECT slug FROM projects WHERE id = ?').get('prj_legacy') as { slug: string };
+        assert.equal(project.slug, 'legacy-project');
+        const bug = upgraded
+          .prepare('SELECT title, task_id FROM bugs WHERE id = ?')
+          .get('bug_legacy') as { title: string; task_id: string | null };
+        assert.equal(bug.title, 'Ownership check passes for unverified offers');
+        assert.equal(bug.task_id, null, 'existing rows get a null default for the new column');
+        const constraint = upgraded
+          .prepare('SELECT statement, active, replaced_by FROM constraints WHERE id = ?')
+          .get('con_legacy') as { statement: string; active: number; replaced_by: string | null };
+        assert.equal(constraint.statement, 'Never infer ownership in the UI');
+        assert.equal(constraint.active, 1);
+        assert.equal(constraint.replaced_by, null);
+        const verification = upgraded
+          .prepare('SELECT command, requirement, bug_id FROM verifications WHERE id = ?')
+          .get('ver_legacy') as { command: string; requirement: string | null; bug_id: string | null };
+        assert.equal(verification.command, 'npm test');
+        assert.equal(verification.requirement, null);
+        assert.equal(verification.bug_id, null);
+
+        // The new columns are writable after the upgrade.
+        upgraded
+          .prepare('UPDATE verifications SET requirement = ?, bug_id = ? WHERE id = ?')
+          .run('Run `npm test`', 'bug_1a2b3c4d', 'ver_legacy');
+        const linked = upgraded
+          .prepare('SELECT requirement, bug_id FROM verifications WHERE id = ?')
+          .get('ver_legacy') as { requirement: string; bug_id: string };
+        assert.equal(linked.requirement, 'Run `npm test`');
+        assert.equal(linked.bug_id, 'bug_1a2b3c4d');
+      } finally {
+        upgraded.close();
+      }
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('rolls back a failed migration together with its version row', () => {
+    const dir = tempDir('master-mcp-migrate');
+    const path = join(dir, 'memory.sqlite');
+    const failing: Migration = {
+      version: LATEST_VERSION + 1,
+      name: 'test-boom',
+      up: (db) => {
+        db.exec('CREATE TABLE boom (id INTEGER PRIMARY KEY)');
+        throw new Error('boom');
+      },
+    };
+    try {
+      const db = openDatabase({ path, clock: fixedClock(NOW) });
+      try {
+        assert.throws(
+          () => migrate(db, fixedClock(LATER), [...MIGRATIONS, failing]),
+          (error: Error & { migration?: { version: number; name: string } }) => {
+            assert.match(
+              error.message,
+              new RegExp(`Migration ${LATEST_VERSION + 1} \\(test-boom\\) failed and was rolled back: boom`),
+            );
+            assert.deepEqual(error.migration, { version: LATEST_VERSION + 1, name: 'test-boom' });
+            return true;
+          },
+        );
+        assert.equal(schemaVersion(db), LATEST_VERSION, 'the version row was rolled back');
+        assert.equal(
+          db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'boom'").get(),
+          undefined,
+          'partial DDL was rolled back',
+        );
+      } finally {
+        db.close();
+      }
+    } finally {
       rmSync(dir, { recursive: true, force: true });
     }
   });

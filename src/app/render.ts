@@ -35,9 +35,53 @@ interface Section {
 
 const DEFAULT_MAX_TOKENS = 2000;
 
-/** `deep` and reverse-engineering briefs legitimately need more room. */
+/** Default budgets: auto 2000, reverse engineering 3000, deep 4000. */
+export const DEFAULT_MAX_BRIEF_TOKENS = DEFAULT_MAX_TOKENS;
+export const RE_MAX_BRIEF_TOKENS = 3000;
+export const DEEP_MAX_BRIEF_TOKENS = 4000;
+/** Hard ceiling: no configuration or flag may exceed this. */
+export const ABSOLUTE_MAX_BRIEF_TOKENS = 12000;
+/** Floor, so an explicit value can never make the brief useless. */
+export const MIN_BRIEF_TOKENS = 400;
+
+export function clampBriefTokens(value: number): number {
+  return Math.min(Math.max(Math.round(value), MIN_BRIEF_TOKENS), ABSOLUTE_MAX_BRIEF_TOKENS);
+}
+
+/** Budget implied by the context mode when nothing was configured. */
+export function autoMaxTokens(input: { mode: string; reverseEngineering?: boolean }): number {
+  if (input.mode === 'deep') return DEEP_MAX_BRIEF_TOKENS;
+  if (input.mode === 're' || input.reverseEngineering) return RE_MAX_BRIEF_TOKENS;
+  return DEFAULT_MAX_BRIEF_TOKENS;
+}
+
+/**
+ * Resolve the brief budget.
+ *
+ * Precedence: an explicit per-call value (CLI flag / MCP option) wins, then a
+ * `max_brief_tokens` written in the config file, then the mode default. Every
+ * explicit value is clamped to the absolute ceiling, so no setting can make the
+ * brief unbounded.
+ */
+export function resolveBriefBudget(input: {
+  mode: string;
+  reverseEngineering?: boolean;
+  configured?: number | null;
+  configuredExplicitly?: boolean;
+  explicit?: number | null;
+}): number {
+  if (input.explicit !== null && input.explicit !== undefined && Number.isFinite(input.explicit)) {
+    return clampBriefTokens(input.explicit);
+  }
+  if (input.configuredExplicitly && input.configured !== null && input.configured !== undefined) {
+    return clampBriefTokens(input.configured);
+  }
+  return autoMaxTokens(input);
+}
+
+/** Token budget implied by the brief itself, when no option overrides it. */
 export function defaultMaxTokens(brief: Brief): number {
-  return brief.task.mode === 'deep' || brief.reverseEngineering?.enabled ? 3000 : DEFAULT_MAX_TOKENS;
+  return autoMaxTokens({ mode: brief.task.mode, reverseEngineering: brief.reverseEngineering?.enabled });
 }
 
 function warningWeight(level: BriefWarning['level']): number {
@@ -250,6 +294,17 @@ function verificationSection(brief: Brief): Section {
     for (const command of plan.commands) header.push(`- ${command}`);
   } else {
     header.push('commands: none configured (.mcp/master-mcp.yaml → verification.test_command)');
+  }
+  if (brief.coverage) {
+    header.push(`coverage: ${brief.coverage.satisfied}/${brief.coverage.total} · status: ${brief.coverage.status}`);
+  }
+  if (brief.coverage && brief.coverage.entries.length > 0) {
+    groups.push(
+      [
+        'requirement coverage:',
+        ...brief.coverage.entries.map((entry) => `- ${entry.satisfied ? '✓' : '✗'} ${entry.requirement}`),
+      ].join('\n'),
+    );
   }
   if (plan.requirements.length > 0) {
     groups.push(['must confirm:', ...plan.requirements.map((requirement) => `- ${requirement}`)].join('\n'));

@@ -67,8 +67,13 @@ Common options
 Examples
   master-mcp context "Fix the incorrect ownership check in the industry-offer UI"
   master-mcp context "Continue runtime validation of discovered managers" --mode re
+  master-mcp context "Read-only triage of the offer pipeline" --mode read_only
   master-mcp complete --task "Fix ownership check" --summary "Replaced UI-derived check" \\
       --files src/industry/offer.ts --test "npm test => pass"
+  master-mcp record --kind decision --body "Ownership comes from the offer record" \\
+      --supersedes dec_0123456789ab
+  master-mcp record --kind constraint --body "Serialization must stay in the domain layer" \\
+      --replaces con_0123456789ab
   master-mcp search "why was UI ownership inference removed"
   master-mcp status
   master-mcp export concurrent-studios --format markdown --out backup.md
@@ -87,6 +92,7 @@ const CONTEXT_FLAGS: FlagSpec[] = [
   { name: 'file', aliases: ['files', 'f'] },
   { name: 'mode' },
   { name: 'refresh', boolean: true },
+  { name: 'max-tokens' },
 ];
 
 const COMPLETE_FLAGS: FlagSpec[] = [
@@ -136,6 +142,9 @@ const RECORD_FLAGS: FlagSpec[] = [
   { name: 'command' },
   { name: 'method' },
   { name: 'result' },
+  { name: 'supersedes' },
+  { name: 'replaces' },
+  { name: 'deactivate' },
 ];
 
 const EXPORT_FLAGS: FlagSpec[] = [...GLOBAL_FLAGS, { name: 'format' }, { name: 'out', aliases: ['o'] }];
@@ -159,6 +168,7 @@ interface CommandHelp {
   summary: string;
   usage: string;
   options?: string[];
+  notes?: string[];
 }
 
 /** Per-command help, printed by `master-mcp <command> --help`. */
@@ -170,6 +180,7 @@ const COMMAND_HELP: Record<string, CommandHelp> = {
       '  --file <path>      Affected file; repeatable, comma-separated allowed',
       '  --mode <mode>      auto | read_only | deep | re (default: auto)',
       '  --refresh          Re-read repository metadata instead of the cached state',
+      '  --max-tokens <n>   Brief token budget override (400-12000; default 2000, deep 4000, re 3000)',
     ],
   },
   complete: {
@@ -189,9 +200,15 @@ const COMMAND_HELP: Record<string, CommandHelp> = {
       '  --blocker <text>   Blocker hit; repeatable',
       '  --follow-up <text> Work for the next pass; repeatable',
       '  --bug-found <t>    Bug discovered here; repeatable',
-      '  --bug-resolved <id>  Bug fixed here; repeatable',
+      '  --bug-resolved <id>  Bug fixed here; fixed_verified only with bug-specific evidence, otherwise fix_claimed',
       '  --subsystem <name> Subsystem this work belongs to',
       '  --status <status>  todo | in_progress | implementation_done | verified_done | blocked | cancelled',
+    ],
+    notes: [
+      'Verification is judged against the task\'s declared requirements (falling back to configured test/lint/build',
+      'commands). Only full coverage reaches verified_done; partial coverage records implementation_done.',
+      'Checks are the evidence (--test, --result): a resolved bug is fixed_verified only when a passing check names',
+      'the bug id, matches its title, or covers a regression requirement.',
     ],
   },
   status: {
@@ -229,6 +246,9 @@ const COMMAND_HELP: Record<string, CommandHelp> = {
       '  --command <cmd>    Verifications: exact command run',
       '  --method <text>    Verifications: what was checked',
       '  --result <r>       Verifications: pass | fail | partial | unknown',
+      '  --supersedes <id>  Decisions: supersede an active decision with this one',
+      '  --replaces <id>    Constraints: replace an active constraint with this one',
+      '  --deactivate <id>  Constraints: retire an active constraint (body is the reason)',
     ],
   },
   export: {
@@ -259,6 +279,7 @@ function renderCommandHelp(command: string): string {
   if (!help) return USAGE;
   const lines = [`${command} — ${help.summary}`, '', 'Usage', `  ${help.usage}`];
   if (help.options && help.options.length > 0) lines.push('', 'Options', ...help.options);
+  if (help.notes && help.notes.length > 0) lines.push('', 'Notes', ...help.notes);
   lines.push('', COMMON_HELP);
   return `${lines.join('\n')}\n`;
 }
@@ -416,6 +437,8 @@ async function runContext(argv: readonly string[], io: CliIo): Promise<number> {
   const options = commonOptions(parsed, io);
   const mode = flagString(parsed, 'mode');
   const affectedFiles = [...flagList(parsed, 'file').flatMap(splitList)];
+  const maxTokensRaw = flagString(parsed, 'max-tokens');
+  const maxTokens = maxTokensRaw ? Number.parseInt(maxTokensRaw, 10) : null;
 
   const result = await withServiceAsync(options, (service) =>
     service.context({
@@ -425,6 +448,7 @@ async function runContext(argv: readonly string[], io: CliIo): Promise<number> {
       affectedFiles,
       mode: mode ?? null,
       refresh: flagBool(parsed, 'refresh'),
+      maxTokens: Number.isFinite(maxTokens) ? maxTokens : null,
     }),
   );
 
@@ -590,6 +614,9 @@ async function runRecord(argv: readonly string[], io: CliIo): Promise<number> {
       command: flagString(parsed, 'command') ?? null,
       method: flagString(parsed, 'method') ?? null,
       result: flagString(parsed, 'result') ?? null,
+      supersedes: flagString(parsed, 'supersedes') ?? null,
+      replaces: flagString(parsed, 'replaces') ?? null,
+      deactivate: flagString(parsed, 'deactivate') ?? null,
     }),
   );
 

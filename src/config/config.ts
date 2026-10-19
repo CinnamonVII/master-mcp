@@ -21,7 +21,7 @@ export const DEFAULT_CONFIG: ProjectConfig = {
   importantPaths: [],
   subsystems: [],
   verification: { testCommand: null, lintCommand: null, buildCommand: null, extraChecks: [] },
-  context: { recentCommits: 10, maxBriefTokens: 2000 },
+  context: { recentCommits: 10, maxBriefTokens: 2000, maxBriefTokensSet: false },
   sourcePath: null,
   warnings: [],
 };
@@ -65,7 +65,15 @@ function asPositiveInt(value: unknown): number | undefined {
 
 /** Interpret a parsed YAML document as a project config, collecting warnings. */
 export function interpretConfig(document: unknown, sourcePath: string | null): ProjectConfig {
-  const config: ProjectConfig = { ...DEFAULT_CONFIG, sourcePath, warnings: [] };
+  const config: ProjectConfig = {
+    ...DEFAULT_CONFIG,
+    // Nested defaults are copied so an explicit value in one file can never
+    // leak into the defaults used by the next load.
+    verification: { ...DEFAULT_CONFIG.verification },
+    context: { ...DEFAULT_CONFIG.context },
+    sourcePath,
+    warnings: [],
+  };
   if (document === null || document === undefined) return config;
   if (!isRecord(document)) {
     config.warnings.push(`${sourcePath ?? 'config'}: expected a YAML mapping at the top level; ignoring file.`);
@@ -115,7 +123,10 @@ export function interpretConfig(document: unknown, sourcePath: string | null): P
       const recentCommits = asPositiveInt(pick(context, 'recent_commits', 'recentCommits'));
       const maxBriefTokens = asPositiveInt(pick(context, 'max_brief_tokens', 'maxBriefTokens'));
       if (recentCommits !== undefined) config.context.recentCommits = Math.min(recentCommits, 100);
-      if (maxBriefTokens !== undefined) config.context.maxBriefTokens = Math.min(Math.max(maxBriefTokens, 400), 12000);
+      if (maxBriefTokens !== undefined) {
+        config.context.maxBriefTokens = Math.min(Math.max(maxBriefTokens, 400), 12000);
+        config.context.maxBriefTokensSet = true;
+      }
     }
   }
 

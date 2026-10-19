@@ -16,7 +16,13 @@ import type {
   VerificationStatus,
 } from '../domain/models.ts';
 import { confidenceRank } from '../domain/vocabulary.ts';
-import { keywords, setOverlap } from '../util/text.ts';
+import { keywords, queryCoverage, setOverlap, truncate } from '../util/text.ts';
+import {
+  assessRequirements,
+  coverageLabel,
+  missingRequirements,
+  type VerificationCoverage,
+} from './verification.ts';
 
 // ---------------------------------------------------------------------------
 // Matching a task string to an existing record
@@ -24,6 +30,17 @@ import { keywords, setOverlap } from '../util/text.ts';
 
 /** Similarity threshold above which a task string is considered the same task. */
 export const TASK_MATCH_THRESHOLD = 0.62;
+
+/**
+ * A candidate must share at least this many content terms with the task string.
+ * "Fix ownership regression in Industry offers" and "Refactor ownership
+ * serialization" share only "ownership"; without this guard the second could
+ * collapse into the first.
+ */
+export const TASK_MATCH_MIN_SHARED_TERMS = 2;
+
+/** …and the task string must cover at least this much of the stored title. */
+export const TASK_MATCH_MIN_COVERAGE = 0.6;
 
 function titleTerms(title: string): Set<string> {
   return new Set(keywords(title));
@@ -44,6 +61,11 @@ export interface TaskMatch {
  * still-open tasks is used, so "Fix technology ownership regression" reuses an
  * existing "Fix the technology ownership regression bug" record instead of
  * creating a duplicate on the second call of the same piece of work.
+ *
+ * Two conservative guards keep distinct work apart: the titles must share at
+ * least two content terms and the task string must cover most of the stored
+ * title. Preferring a duplicate over collapsing two different tasks is
+ * deliberate — duplicates are visible and cheap, a wrong merge is neither.
  */
 export function matchTask(tasks: readonly Task[], title: string): TaskMatch | null {
   const needle = title.trim();
@@ -58,8 +80,12 @@ export function matchTask(tasks: readonly Task[], title: string): TaskMatch | nu
   let best: TaskMatch | null = null;
   for (const task of tasks) {
     if (task.status === 'cancelled' || task.status === 'verified_done') continue;
-    const similarity = setOverlap(needleTerms, titleTerms(task.title));
+    const taskTerms = titleTerms(task.title);
+    const similarity = setOverlap(needleTerms, taskTerms);
     if (similarity < TASK_MATCH_THRESHOLD) continue;
+    const shared = [...needleTerms].filter((term) => taskTerms.has(term)).length;
+    if (shared < TASK_MATCH_MIN_SHARED_TERMS) continue;
+    if (queryCoverage(needleTerms, taskTerms) < TASK_MATCH_MIN_COVERAGE) continue;
     if (!best || similarity > best.similarity) best = { task, similarity, exact: false };
   }
   return best;
@@ -137,6 +163,77 @@ export function classifyVerification(input: {
 
   notes.push('No verification evidence was provided: implementation is recorded, verification is missing.');
   return { status: 'none', accepted: [], notes };
+}
+
+// ---------------------------------------------------------------------------
+// Requirement-aware completion classification
+// ---------------------------------------------------------------------------
+
+/** A classification that also carries the coverage it was derived from. */
+export interface CompletionClassification extends VerificationClassification {
+  /** Present when the task declared requirements or config supplied them. */
+  coverage: VerificationCoverage | null;
+}
+
+/**
+ * Classify a completion against the requirements the task has to meet.
+ *
+ * This is the trust boundary that makes `master_complete` requirement-aware:
+ * with requirements in play, only full coverage reaches `verified`. One check
+ * of three is `partial`, which the status rules map to `implementation_done`
+ * rather than `verified_done`.
+ *
+ * With no requirements the previous evidence-only rules apply unchanged, so
+ * projects that declare nothing keep working exactly as before.
+ */
+export function classifyCompletion(input: {
+  requirements: readonly string[];
+  claims: readonly VerificationClaim[];
+  results?: readonly string[];
+}): CompletionClassification {
+  const requirements = input.requirements.map((requirement) => requirement.trim()).filter((requirement) => requirement.length > 0);
+  if (requirements.length === 0) {
+    const base = classifyVerification({ claims: input.claims, results: input.results });
+    return { ...base, coverage: null };
+  }
+
+  const notes: string[] = [];
+  const accepted = input.claims.filter((claim) => claim.result !== 'unknown' || claim.evidence.length > 0);
+  const coverage = assessRequirements(requirements, input.claims);
+
+  if (input.claims.some((claim) => claim.result === 'fail')) {
+    notes.push(
+      `At least one verification reported a failure: the task is not verified (coverage ${coverageLabel(coverage)}).`,
+    );
+    return { status: 'failed', accepted, notes, coverage };
+  }
+
+  if (input.claims.length === 0) {
+    if ((input.results?.length ?? 0) > 0) {
+      notes.push(
+        `Declared requirements: ${coverage.total}. None were covered by a test command or evidence.`,
+      );
+      notes.push(
+        'Results were described but no test command or evidence was provided: recorded as claimed, not verified.',
+      );
+      return { status: 'claimed', accepted: [], notes, coverage };
+    }
+    notes.push('No verification evidence was provided: implementation is recorded, verification is missing.');
+    return { status: 'none', accepted: [], notes, coverage };
+  }
+
+  if (coverage.status === 'verified') {
+    notes.push(`All ${coverage.total} declared requirement(s) covered by passing evidence.`);
+    return { status: 'verified', accepted, notes, coverage };
+  }
+
+  const missing = missingRequirements(coverage);
+  notes.push(
+    `Verification coverage ${coverageLabel(coverage)}: ${missing.length} requirement(s) still uncovered — ` +
+      `${missing.slice(0, 3).map((requirement) => truncate(requirement, 90)).join('; ')}. ` +
+      'Recorded as implementation_done, not verified_done.',
+  );
+  return { status: 'partial', accepted, notes, coverage };
 }
 
 // ---------------------------------------------------------------------------

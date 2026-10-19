@@ -243,8 +243,8 @@ export function writeSnapshot(store: Store, snapshot: ProjectSnapshot, options: 
     }
 
     const constraintStatement = db.prepare(
-      `INSERT OR REPLACE INTO constraints (id, project_id, statement, subsystem, severity, files, source, active, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      `INSERT OR REPLACE INTO constraints (id, project_id, statement, subsystem, severity, files, source, active, replaced_by, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     );
     written['constraints'] = 0;
     for (const constraint of snapshot.constraints) {
@@ -257,6 +257,7 @@ export function writeSnapshot(store: Store, snapshot: ProjectSnapshot, options: 
         arr(constraint.files),
         constraint.source,
         int(constraint.active),
+        constraint.replacedBy ? (constraintIdMap.get(constraint.replacedBy) ?? constraint.replacedBy) : null,
         constraint.createdAt ?? options.now,
         constraint.updatedAt ?? options.now,
       );
@@ -265,8 +266,8 @@ export function writeSnapshot(store: Store, snapshot: ProjectSnapshot, options: 
 
     const bugStatement = db.prepare(
       `INSERT OR REPLACE INTO bugs (id, project_id, title, severity, status, subsystem, reproduction, expected, observed,
-                                    evidence, files, commits, created_at, updated_at, resolved_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                                    evidence, files, commits, created_at, updated_at, resolved_at, task_id)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     );
     written['bugs'] = 0;
     for (const bug of snapshot.bugs) {
@@ -286,6 +287,7 @@ export function writeSnapshot(store: Store, snapshot: ProjectSnapshot, options: 
         bug.createdAt ?? options.now,
         bug.updatedAt ?? options.now,
         bug.resolvedAt,
+        mapTask(bug.taskId),
       );
       written['bugs'] = (written['bugs'] ?? 0) + 1;
     }
@@ -314,8 +316,8 @@ export function writeSnapshot(store: Store, snapshot: ProjectSnapshot, options: 
     }
 
     const verificationStatement = db.prepare(
-      `INSERT OR REPLACE INTO verifications (id, project_id, task_id, method, command, result, evidence, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      `INSERT OR REPLACE INTO verifications (id, project_id, task_id, method, command, result, evidence, requirement, bug_id, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     );
     written['verifications'] = 0;
     for (const verification of snapshot.verifications) {
@@ -327,6 +329,8 @@ export function writeSnapshot(store: Store, snapshot: ProjectSnapshot, options: 
         verification.command,
         verification.result,
         arr(verification.evidence),
+        verification.requirement ?? null,
+        verification.bugId ?? null,
         verification.createdAt ?? options.now,
       );
       written['verifications'] = (written['verifications'] ?? 0) + 1;
@@ -406,24 +410,24 @@ export function reindexProject(store: Store, projectId: string): void {
   ).all(projectId) as Array<Record<string, SqlValue>>);
 
   collect(db.prepare(
-    `SELECT 'decision' AS kind, id AS ref_id, created_at, subsystem, statement AS title,
+    `SELECT 'decision' AS kind, id AS ref_id, updated_at AS created_at, subsystem, statement AS title,
             COALESCE(rationale, '') || ' ' || COALESCE(alternatives, '') AS body
      FROM decisions WHERE project_id = ?`,
   ).all(projectId) as Array<Record<string, SqlValue>>);
 
   collect(db.prepare(
-    `SELECT 'constraint' AS kind, id AS ref_id, created_at, subsystem, statement AS title, '' AS body
+    `SELECT 'constraint' AS kind, id AS ref_id, updated_at AS created_at, subsystem, statement AS title, '' AS body
      FROM constraints WHERE project_id = ?`,
   ).all(projectId) as Array<Record<string, SqlValue>>);
 
   collect(db.prepare(
-    `SELECT 'bug' AS kind, id AS ref_id, created_at, subsystem, title,
+    `SELECT 'bug' AS kind, id AS ref_id, updated_at AS created_at, subsystem, title,
             COALESCE(observed, '') || ' ' || COALESCE(expected, '') || ' ' || COALESCE(reproduction, '') || ' ' || COALESCE(evidence, '') AS body
      FROM bugs WHERE project_id = ?`,
   ).all(projectId) as Array<Record<string, SqlValue>>);
 
   collect(db.prepare(
-    `SELECT 'finding' AS kind, id AS ref_id, created_at, subsystem, statement AS title,
+    `SELECT 'finding' AS kind, id AS ref_id, updated_at AS created_at, subsystem, statement AS title,
             COALESCE(evidence, '') || ' ' || COALESCE(symbols, '') AS body
      FROM findings WHERE project_id = ?`,
   ).all(projectId) as Array<Record<string, SqlValue>>);

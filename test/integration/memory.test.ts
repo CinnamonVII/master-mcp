@@ -161,14 +161,22 @@ describe('bugs', () => {
           files: [OFFER_FILE],
         });
 
-        // Verified resolution: a passing command with evidence.
+        // Verified resolution: generic suite passes are not enough — the
+        // evidence must name the defect it actually covers.
         const verified = await service.complete({
           summary: 'Ownership now comes from the offer record.',
           taskId: verifiedTask.taskId,
           bugsResolved: [first.id],
-          testsRun: [{ command: 'npm test', result: 'pass', evidence: ['24 passing'] }],
+          testsRun: [
+            {
+              command: 'npm test',
+              result: 'pass',
+              evidence: [`regression coverage for ${first.id}`, '24 passing'],
+            },
+          ],
         });
         assert.deepEqual(verified.recorded.bugsUpdated, [first.id]);
+        assert.ok(!verified.notes.some((note) => /fix_claimed, not fixed_verified/.test(note)));
 
         // Claimed resolution without evidence.
         const claimedTask = await service.context({ task: 'Hide withdrawn offers from the offer list' });

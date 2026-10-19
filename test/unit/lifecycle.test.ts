@@ -11,6 +11,7 @@ import { describe, it } from 'node:test';
 import type { Task } from '../../src/domain/models.ts';
 import {
   claimHasEvidence,
+  classifyCompletion,
   classifyVerification,
   decideTaskStatus,
   guardConfidence,
@@ -64,6 +65,20 @@ describe('matchTask', () => {
 
   it('does not match unrelated work', () => {
     assert.equal(matchTask([task({ title: 'Fix the ownership check' })], 'Add CSV export to the billing screen'), null);
+  });
+
+  it('does not collapse two different ownership tasks', () => {
+    // "Fix ownership regression in Industry offers" and "Refactor ownership
+    // serialization" share only "ownership"; merging them would hide work.
+    const stored = task({ title: 'Refactor ownership serialization' });
+    assert.equal(matchTask([stored], 'Fix ownership regression in Industry offers'), null);
+  });
+
+  it('matches the technology ownership regression wording used in practice', () => {
+    const stored = task({ title: 'Fix the technology ownership regression bug' });
+    const match = matchTask([stored], 'Fix technology ownership regression');
+    assert.ok(match);
+    assert.equal(match.task.id, stored.id);
   });
 
   it('never matches a finished or cancelled task by similarity', () => {
@@ -207,6 +222,74 @@ describe('guardConfidence', () => {
   it('never downgrades hypotheses or suspicions', () => {
     assert.equal(guardConfidence({ requested: 'hypothesis', evidence: [], files: [], symbols: [] }).confidence, 'hypothesis');
     assert.equal(guardConfidence({ requested: 'suspected', evidence: [], files: [], symbols: [] }).confidence, 'suspected');
+  });
+});
+
+describe('classifyCompletion', () => {
+  const requirements = ['Run `npm test`', 'Run `npm run lint`', 'Run `npm run build`'];
+
+  it('maps one of three passing checks to partial, not verified', () => {
+    const result = classifyCompletion({
+      requirements,
+      claims: [claim({ command: 'npm test' })],
+    });
+    assert.equal(result.status, 'partial');
+    assert.equal(result.coverage?.status, 'partial');
+    assert.equal(result.coverage?.satisfied, 1);
+    assert.equal(result.coverage?.total, 3);
+    assert.ok(result.notes.some((note) => /coverage 1\/3/.test(note)));
+    assert.ok(result.notes.some((note) => /implementation_done, not verified_done/.test(note)));
+  });
+
+  it('reaches verified only when every requirement is covered', () => {
+    const result = classifyCompletion({
+      requirements,
+      claims: [
+        claim({ command: 'npm test' }),
+        claim({ command: 'npm run lint' }),
+        claim({ command: 'npm run build' }),
+      ],
+    });
+    assert.equal(result.status, 'verified');
+    assert.equal(result.coverage?.status, 'verified');
+    assert.ok(result.notes.some((note) => /All 3 declared requirement/.test(note)));
+  });
+
+  it('lets a failure win over partial coverage', () => {
+    const result = classifyCompletion({
+      requirements,
+      claims: [claim({ command: 'npm test' }), claim({ command: 'npm run lint', result: 'fail' })],
+    });
+    assert.equal(result.status, 'failed');
+    assert.equal(result.coverage?.satisfied, 1);
+    assert.ok(result.notes.some((note) => /not verified \(coverage 1\/3\)/.test(note)));
+  });
+
+  it('stays claimed or none when no claim covers a requirement', () => {
+    const claimed = classifyCompletion({ requirements, claims: [], results: ['looked fine locally'] });
+    assert.equal(claimed.status, 'claimed');
+    assert.ok(claimed.notes.some((note) => /Declared requirements: 3/.test(note)));
+
+    const none = classifyCompletion({ requirements, claims: [] });
+    assert.equal(none.status, 'none');
+  });
+
+  it('keeps evidence-only behaviour when nothing is required', () => {
+    const result = classifyCompletion({
+      requirements: [],
+      claims: [claim({ command: 'npm test' })],
+    });
+    assert.equal(result.status, 'verified');
+    assert.equal(result.coverage, null, 'no coverage is invented when nothing is required');
+  });
+
+  it('ignores blank requirement strings', () => {
+    const result = classifyCompletion({
+      requirements: ['   ', ''],
+      claims: [claim({ command: 'npm test' })],
+    });
+    assert.equal(result.coverage, null);
+    assert.equal(result.status, 'verified');
   });
 });
 

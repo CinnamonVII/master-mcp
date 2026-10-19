@@ -81,6 +81,10 @@ export interface MigrationResult {
  * Apply pending migrations. Safe to call on every open: already-applied
  * versions are skipped, so restarting the process is a no-op.
  *
+ * Each migration runs inside a single SQLite transaction together with its
+ * `migrations` row, so a failure rolls the schema back completely and the
+ * version stays unrecorded. Partial application is not possible.
+ *
  * `migrations` is injectable so tests can prove that a new migration is
  * applied incrementally to an existing database.
  */
@@ -98,20 +102,42 @@ export function migrate(
   const appliedRows = db.prepare('SELECT version FROM migrations').all() as Array<{ version: number }>;
   const applied = new Set(appliedRows.map((row) => Number(row.version)));
   const newlyApplied: number[] = [];
+  const insert = db.prepare('INSERT INTO migrations (version, name, applied_at) VALUES (?, ?, ?)');
 
   for (const migration of [...migrations].sort((a, b) => a.version - b.version)) {
     if (applied.has(migration.version)) continue;
-    migration.up(db);
-    db.prepare('INSERT INTO migrations (version, name, applied_at) VALUES (?, ?, ?)').run(
-      migration.version,
-      migration.name,
-      clock ? isoNow(clock) : new Date().toISOString(),
-    );
+    db.exec('BEGIN IMMEDIATE');
+    try {
+      migration.up(db);
+      insert.run(migration.version, migration.name, clock ? isoNow(clock) : new Date().toISOString());
+      db.exec('COMMIT');
+    } catch (error) {
+      try {
+        db.exec('ROLLBACK');
+      } catch {
+        // The transaction was already aborted; the useful error is the original.
+      }
+      throw migrationError(migration, error);
+    }
     newlyApplied.push(migration.version);
   }
 
   const highest = migrations.reduce((max, migration) => Math.max(max, migration.version), 0);
   return { applied: newlyApplied, version: highest };
+}
+
+/** Wrap a failed migration in an error that names it and points at rollback. */
+function migrationError(migration: Migration, cause: unknown): Error {
+  const detail = cause instanceof Error ? cause.message : String(cause);
+  const error = new Error(
+    `Migration ${migration.version} (${migration.name}) failed and was rolled back: ${detail}`,
+  );
+  (error as Error & { cause?: unknown }).cause = cause;
+  (error as Error & { migration: { version: number; name: string } }).migration = {
+    version: migration.version,
+    name: migration.name,
+  };
+  return error;
 }
 
 /** Current schema version recorded in the database (0 for an unmigrated file). */

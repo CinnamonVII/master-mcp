@@ -166,6 +166,7 @@ function mapConstraint(row: RawRow): Constraint {
     files: parseArray(row['files']),
     source: text(row['source']),
     active: toBool(row['active']),
+    replacedBy: text(row['replaced_by']),
     createdAt: String(row['created_at']),
     updatedAt: String(row['updated_at']),
   };
@@ -188,6 +189,7 @@ function mapBug(row: RawRow): Bug {
     createdAt: String(row['created_at']),
     updatedAt: String(row['updated_at']),
     resolvedAt: text(row['resolved_at']),
+    taskId: text(row['task_id']),
   };
 }
 
@@ -216,6 +218,8 @@ function mapVerification(row: RawRow): Verification {
     command: text(row['command']),
     result: String(row['result']) as VerificationResult,
     evidence: parseArray(row['evidence']),
+    requirement: text(row['requirement']),
+    bugId: text(row['bug_id']),
     createdAt: String(row['created_at']),
   };
 }
@@ -328,6 +332,7 @@ export interface CreateBugInput {
   evidence?: readonly string[];
   files?: readonly string[];
   commits?: readonly string[];
+  taskId?: string | null;
   now: string;
 }
 
@@ -352,6 +357,8 @@ export interface CreateVerificationInput {
   command?: string | null;
   result: VerificationResult;
   evidence?: readonly string[];
+  requirement?: string | null;
+  bugId?: string | null;
   now: string;
 }
 
@@ -402,6 +409,7 @@ export interface BugPatch {
   files?: readonly string[];
   commits?: readonly string[];
   resolvedAt?: string | null;
+  taskId?: string | null;
   now: string;
 }
 
@@ -416,8 +424,24 @@ export interface FindingPatch {
 }
 
 export interface DecisionPatch {
+  statement?: string;
+  rationale?: string | null;
+  subsystem?: string | null;
+  alternatives?: readonly string[];
+  files?: readonly string[];
+  commits?: readonly string[];
   status?: Decision['status'];
   supersededBy?: string | null;
+  now: string;
+}
+
+export interface ConstraintPatch {
+  statement?: string;
+  subsystem?: string | null;
+  severity?: Severity;
+  files?: readonly string[];
+  active?: boolean;
+  replacedBy?: string | null;
   now: string;
 }
 
@@ -443,6 +467,7 @@ export class Store {
   private readonly db: DatabaseSync;
   private readonly activityRetention: number;
   private readonly statementCache = new Map<string, StatementSync>();
+  private transactionDepth = 0;
 
   constructor(db: DatabaseSync, options: StoreOptions = {}) {
     this.db = db;
@@ -762,7 +787,7 @@ export class Store {
       input.now,
     );
     const decision = this.getDecision(id)!;
-    this.reindex('decision', decision.id, decision.projectId, decision.createdAt, decision.subsystem, decision.statement, [
+    this.reindex('decision', decision.id, decision.projectId, decision.updatedAt, decision.subsystem, decision.statement, [
       decision.rationale,
       ...decision.alternatives,
     ]);
@@ -788,7 +813,40 @@ export class Store {
       now,
       id,
     );
-    return this.getDecision(id);
+    const decision = this.getDecision(id);
+    if (decision) {
+      this.reindex('decision', decision.id, decision.projectId, decision.updatedAt, decision.subsystem, decision.statement, [
+        decision.rationale,
+        ...decision.alternatives,
+      ]);
+    }
+    return decision;
+  }
+
+  updateDecision(id: string, patch: DecisionPatch): Decision {
+    const sets: string[] = ['updated_at = ?'];
+    const values: SqlValue[] = [patch.now];
+    const push = (column: string, value: SqlValue): void => {
+      sets.push(`${column} = ?`);
+      values.push(value);
+    };
+    if (patch.statement !== undefined) push('statement', patch.statement);
+    if (patch.rationale !== undefined) push('rationale', patch.rationale);
+    if (patch.subsystem !== undefined) push('subsystem', patch.subsystem);
+    if (patch.alternatives !== undefined) push('alternatives', jsonArray(patch.alternatives));
+    if (patch.files !== undefined) push('files', jsonArray(patch.files));
+    if (patch.commits !== undefined) push('commits', jsonArray(patch.commits));
+    if (patch.status !== undefined) push('status', patch.status);
+    if (patch.supersededBy !== undefined) push('superseded_by', patch.supersededBy);
+    values.push(id);
+    this.stmt(`UPDATE decisions SET ${sets.join(', ')} WHERE id = ?`).run(...values);
+    const decision = this.getDecision(id);
+    if (!decision) throw new Error(`Decision ${id} not found`);
+    this.reindex('decision', decision.id, decision.projectId, decision.updatedAt, decision.subsystem, decision.statement, [
+      decision.rationale,
+      ...decision.alternatives,
+    ]);
+    return decision;
   }
 
   // -------------------------------------------------------------------------
@@ -812,7 +870,7 @@ export class Store {
       input.now,
     );
     const constraint = this.getConstraint(id)!;
-    this.reindex('constraint', constraint.id, constraint.projectId, constraint.createdAt, constraint.subsystem, constraint.statement, []);
+    this.reindex('constraint', constraint.id, constraint.projectId, constraint.updatedAt, constraint.subsystem, constraint.statement, []);
     return constraint;
   }
 
@@ -832,7 +890,85 @@ export class Store {
 
   deactivateConstraint(id: string, now: string): Constraint | null {
     this.stmt('UPDATE constraints SET active = 0, updated_at = ? WHERE id = ?').run(now, id);
-    return this.getConstraint(id);
+    const constraint = this.getConstraint(id);
+    if (constraint) {
+      this.reindex('constraint', constraint.id, constraint.projectId, constraint.updatedAt, constraint.subsystem, constraint.statement, []);
+    }
+    return constraint;
+  }
+
+  /**
+   * Deactivate a constraint and record which constraint replaced it, in one
+   * transaction so the pair of updates cannot half-apply.
+   */
+  replaceConstraint(id: string, replacedBy: string, now: string): Constraint | null {
+    let replaced: Constraint | null = null;
+    this.transaction(() => {
+      this.stmt('UPDATE constraints SET active = 0, replaced_by = ?, updated_at = ? WHERE id = ?').run(
+        replacedBy,
+        now,
+        id,
+      );
+      replaced = this.getConstraint(id);
+    });
+    return replaced;
+  }
+
+  updateConstraint(id: string, patch: ConstraintPatch): Constraint {
+    const sets: string[] = ['updated_at = ?'];
+    const values: SqlValue[] = [patch.now];
+    const push = (column: string, value: SqlValue): void => {
+      sets.push(`${column} = ?`);
+      values.push(value);
+    };
+    if (patch.statement !== undefined) push('statement', patch.statement);
+    if (patch.subsystem !== undefined) push('subsystem', patch.subsystem);
+    if (patch.severity !== undefined) push('severity', patch.severity);
+    if (patch.files !== undefined) push('files', jsonArray(patch.files));
+    if (patch.active !== undefined) push('active', bool(patch.active));
+    if (patch.replacedBy !== undefined) push('replaced_by', patch.replacedBy);
+    values.push(id);
+    this.stmt(`UPDATE constraints SET ${sets.join(', ')} WHERE id = ?`).run(...values);
+    const constraint = this.getConstraint(id);
+    if (!constraint) throw new Error(`Constraint ${id} not found`);
+    this.reindex('constraint', constraint.id, constraint.projectId, constraint.updatedAt, constraint.subsystem, constraint.statement, []);
+    return constraint;
+  }
+
+  /**
+   * Run `fn` inside one SQLite transaction. Any throw rolls the whole unit of
+   * work back, which is what keeps lifecycle edits (create + supersede) atomic.
+   *
+   * Reentrant: a helper such as `replaceConstraint` may open a transaction
+   * inside the service's create+replace transaction, and the inner call simply
+   * joins the outer one. Only the outermost scope commits or rolls back.
+   */
+  transaction<T>(fn: () => T): T {
+    if (this.transactionDepth > 0) {
+      this.transactionDepth += 1;
+      try {
+        return fn();
+      } finally {
+        this.transactionDepth -= 1;
+      }
+    }
+
+    this.db.exec('BEGIN IMMEDIATE');
+    this.transactionDepth = 1;
+    try {
+      const result = fn();
+      this.db.exec('COMMIT');
+      return result;
+    } catch (error) {
+      try {
+        this.db.exec('ROLLBACK');
+      } catch {
+        // Already aborted; the original error is the one worth surfacing.
+      }
+      throw error;
+    } finally {
+      this.transactionDepth = 0;
+    }
   }
 
   // -------------------------------------------------------------------------
@@ -843,8 +979,8 @@ export class Store {
     const id = input.id ?? newId('bug');
     this.stmt(
       `INSERT INTO bugs (id, project_id, title, severity, status, subsystem, reproduction, expected, observed,
-                         evidence, files, commits, created_at, updated_at, resolved_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)`,
+                         evidence, files, commits, created_at, updated_at, resolved_at, task_id)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)`,
     ).run(
       id,
       input.projectId,
@@ -860,6 +996,7 @@ export class Store {
       jsonArray(input.commits),
       input.now,
       input.now,
+      input.taskId ?? null,
     );
     const bug = this.getBug(id)!;
     this.reindex('bug', bug.id, bug.projectId, bug.createdAt, bug.subsystem, bug.title, [
@@ -904,6 +1041,14 @@ export class Store {
     return row ? mapBug(row) : null;
   }
 
+  /** Bugs whose fix was claimed or verified by a particular task. */
+  listBugsForTask(projectId: string, taskId: string): Bug[] {
+    const rows = this.stmt(
+      'SELECT * FROM bugs WHERE project_id = ? AND task_id = ? ORDER BY created_at DESC',
+    ).all(projectId, taskId) as RawRow[];
+    return rows.map(mapBug);
+  }
+
   updateBug(id: string, patch: BugPatch): Bug {
     const sets: string[] = ['updated_at = ?'];
     const values: SqlValue[] = [patch.now];
@@ -922,6 +1067,7 @@ export class Store {
     if (patch.files !== undefined) push('files', jsonArray(patch.files));
     if (patch.commits !== undefined) push('commits', jsonArray(patch.commits));
     if (patch.resolvedAt !== undefined) push('resolved_at', patch.resolvedAt);
+    if (patch.taskId !== undefined) push('task_id', patch.taskId);
     values.push(id);
     this.stmt(`UPDATE bugs SET ${sets.join(', ')} WHERE id = ?`).run(...values);
     const bug = this.getBug(id);
@@ -1014,8 +1160,8 @@ export class Store {
   createVerification(input: CreateVerificationInput): Verification {
     const id = input.id ?? newId('verification');
     this.stmt(
-      `INSERT INTO verifications (id, project_id, task_id, method, command, result, evidence, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      `INSERT INTO verifications (id, project_id, task_id, method, command, result, evidence, requirement, bug_id, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     ).run(
       id,
       input.projectId,
@@ -1024,6 +1170,8 @@ export class Store {
       input.command ?? null,
       input.result,
       jsonArray(input.evidence),
+      input.requirement ?? null,
+      input.bugId ?? null,
       input.now,
     );
     const verification = this.getVerification(id)!;
@@ -1327,7 +1475,7 @@ export class Store {
         severity: null,
         confidence: null,
         verification: null,
-        createdAt: decision.createdAt,
+        createdAt: decision.updatedAt,
         taskId: null,
         head: null,
         branch: null,
@@ -1351,7 +1499,7 @@ export class Store {
         severity: constraint.severity,
         confidence: null,
         verification: null,
-        createdAt: constraint.createdAt,
+        createdAt: constraint.updatedAt,
         taskId: null,
         head: null,
         branch: null,
@@ -1376,7 +1524,7 @@ export class Store {
         confidence: null,
         verification: null,
         createdAt: bug.updatedAt,
-        taskId: null,
+        taskId: bug.taskId,
         head: null,
         branch: null,
         terms: keywords(

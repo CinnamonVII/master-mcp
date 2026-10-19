@@ -12,8 +12,10 @@
  */
 import type { DatabaseSync } from 'node:sqlite';
 import type {
+  Bug,
   Confidence,
-  Finding,
+  Constraint,
+  Decision,
   Handoff,
   MemoryItem,
   Project,
@@ -46,16 +48,25 @@ import {
 import { keywords, truncate } from '../util/text.ts';
 import { CONTEXT_MODES, interpretTask, type ContextMode, type TaskInterpretation } from './interpret.ts';
 import { assembleBrief, type Brief } from './assembler.ts';
-import { renderBrief, renderStatus } from './render.ts';
+import { renderBrief, renderStatus, resolveBriefBudget } from './render.ts';
 import { buildStatus, type StatusReport } from './status.ts';
 import {
-  classifyVerification,
+  classifyCompletion,
   decideTaskStatus,
   guardConfidence,
   matchTask,
   needsWork,
   type VerificationClaim,
 } from './lifecycle.ts';
+import {
+  bugEvidence,
+  claimVerifiesBug,
+  effectiveRequirements,
+  missingRequirements,
+  requirementFor,
+  type VerificationCoverage,
+} from './verification.ts';
+import { findDuplicate, mergeStrings, type DedupExisting } from './dedup.ts';
 import { exportMarkdown } from './transfer.ts';
 
 // ---------------------------------------------------------------------------
@@ -69,6 +80,8 @@ export interface MasterContextInput {
   affectedFiles?: readonly string[] | null;
   mode?: string | null;
   refresh?: boolean | null;
+  /** Per-call brief budget override, clamped to the absolute ceiling. */
+  maxTokens?: number | null;
 }
 
 export interface MasterContextResult {
@@ -207,6 +220,12 @@ export interface MasterRecordInput {
   command?: string | null;
   result?: string | null;
   method?: string | null;
+  /** `decision` only: id of the decision this one supersedes. */
+  supersedes?: string | null;
+  /** `constraint` only: id of the constraint this one replaces. */
+  replaces?: string | null;
+  /** `constraint` only: id of a constraint to deactivate without replacement. */
+  deactivate?: string | null;
 }
 
 export interface MasterRecordResult {
@@ -410,10 +429,15 @@ export class MasterMcpService {
       warnings: discovery.warnings,
     });
 
-    const maxTokens = Math.min(
-      discovery.config.context.maxBriefTokens,
-      mode === 'deep' ? 4000 : 2000,
-    );
+    // Budget policy: an explicit per-call value wins, then an explicit config
+    // value, then the mode default — always clamped to the absolute ceiling.
+    const maxTokens = resolveBriefBudget({
+      mode: interpretation.mode,
+      reverseEngineering: brief.reverseEngineering?.enabled ?? false,
+      configured: discovery.config.context.maxBriefTokens,
+      configuredExplicitly: discovery.config.context.maxBriefTokensSet,
+      explicit: input.maxTokens ?? null,
+    });
     const text = renderBrief(brief, { maxTokens });
 
     if (allowCreate) {
@@ -561,7 +585,27 @@ export class MasterMcpService {
     const unresolved = dedupe(input.unresolved);
 
     const claims = normalizeClaims(input.testsRun ?? [], input.verification ?? []);
-    const classification = classifyVerification({ claims, results: dedupe(input.results) });
+    const results = dedupe(input.results);
+
+    // Requirements are the task's own when it declared them, otherwise the
+    // configured checks. The task type comes from the same deterministic
+    // interpretation used by master_context, so docs/investigation work is
+    // exempt from the build/test gate in both tools.
+    const interpretation = interpretTask({
+      task: task.title,
+      project: discovery.project,
+      config: discovery.config,
+      knownSubsystems: this.store.knownSubsystems(discovery.project.id),
+      affectedFiles: dedupe([...task.affectedFiles, ...filesChanged]),
+      recentlyChangedFiles: observation?.recentlyChangedFiles ?? [],
+      mode: 'auto',
+    });
+    const requirements = effectiveRequirements({
+      task,
+      config: discovery.config,
+      taskType: interpretation.taskType,
+    });
+    const classification = classifyCompletion({ requirements, claims, results });
     notes.push(...classification.notes);
 
     const requestedStatus = parseTaskStatus(input.status) ?? null;
@@ -578,10 +622,27 @@ export class MasterMcpService {
     notes.push(...decision.notes);
 
     // ---------------------------------------------------------------------
+    // Bugs to evaluate
+    // ---------------------------------------------------------------------
+    // Resolve every bug this completion speaks to *before* storing evidence, so
+    // each verification can be attributed to the bug it actually verifies.
+    const bugsToEvaluate = this.collectBugsToEvaluate(
+      discovery.project.id,
+      task.id,
+      dedupe(input.bugsResolved),
+      notes,
+    );
+    const bugVerdicts = new Map<string, ReturnType<typeof bugEvidence>>();
+    for (const bug of bugsToEvaluate) {
+      bugVerdicts.set(bug.id, bugEvidence({ bug, claims, requirements }));
+    }
+
+    // ---------------------------------------------------------------------
     // Verifications
     // ---------------------------------------------------------------------
     const verificationIds: string[] = [];
     for (const claim of classification.accepted) {
+      const verifiedBug = bugsToEvaluate.find((candidate) => claimVerifiesBug(candidate, claim, requirements));
       const verification = this.store.createVerification({
         projectId: discovery.project.id,
         taskId: task.id,
@@ -589,6 +650,8 @@ export class MasterMcpService {
         command: claim.command,
         result: claim.result,
         evidence: claim.evidence,
+        requirement: requirementFor(requirements, claim),
+        bugId: verifiedBug?.id ?? null,
         now,
       });
       verificationIds.push(verification.id);
@@ -599,10 +662,17 @@ export class MasterMcpService {
     // ---------------------------------------------------------------------
     const findingIds: string[] = [];
     const resolvedSubsystem = task.subsystem ?? null;
+    const openFindingCandidates: DedupExisting[] = this.store
+      .listFindings(discovery.project.id, { limit: 400 })
+      .map((finding) => ({
+        id: finding.id,
+        text: finding.statement,
+        detail: finding.evidence.join(' '),
+        subsystem: finding.subsystem,
+      }));
     for (const discoveryItem of input.discoveries ?? []) {
       const parsed = normalizeDiscovery(discoveryItem);
       if (!parsed) continue;
-      const existing = this.findFindingByStatement(discovery.project.id, parsed.statement);
       const files = parsed.files.length > 0 ? parsed.files : [];
       const symbols = parsed.symbols;
       const guard = guardConfidence({
@@ -614,23 +684,35 @@ export class MasterMcpService {
       if (guard.downgradedFrom) {
         notes.push(`Finding "${truncate(parsed.statement, 60)}": ${guard.reason}`);
       }
-      if (existing) {
-        // Same statement: strengthen rather than duplicate.
-        const strengthened = guard.confidence;
-        const mergedEvidence = dedupe([...existing.evidence, ...parsed.evidence]);
-        const keepExisting =
-          isConfidenceAtLeast(existing.confidence, strengthened) || existing.evidence.length >= parsed.evidence.length;
-        const updated = this.store.updateFinding(existing.id, {
-          confidence: keepExisting ? existing.confidence : strengthened,
-          evidence: mergedEvidence,
-          files: dedupe([...existing.files, ...files]),
-          symbols: dedupe([...existing.symbols, ...symbols]),
-          now,
-        });
-        findingIds.push(updated.id);
-        notes.push(`Finding ${updated.id} already existed; merged evidence instead of duplicating it.`);
-        continue;
+
+      const duplicate = findDuplicate(
+        { text: parsed.statement, detail: parsed.evidence.join(' '), subsystem: parsed.subsystem ?? resolvedSubsystem },
+        openFindingCandidates,
+      );
+      if (duplicate) {
+        if (duplicate.verdict === 'borderline') {
+          notes.push(`Finding "${truncate(parsed.statement, 60)}": ${duplicate.reason}.`);
+        } else {
+          const existing = this.store.getFinding(duplicate.id);
+          if (existing) {
+            // Same finding: strengthen rather than duplicate. Confidence never
+            // drops, and evidence/files/symbols only ever grow.
+            const mergedEvidence = dedupe([...existing.evidence, ...parsed.evidence]);
+            const keepExisting = isConfidenceAtLeast(existing.confidence, guard.confidence);
+            const updated = this.store.updateFinding(existing.id, {
+              confidence: keepExisting ? existing.confidence : guard.confidence,
+              evidence: mergedEvidence,
+              files: dedupe([...existing.files, ...files]),
+              symbols: dedupe([...existing.symbols, ...symbols]),
+              now,
+            });
+            findingIds.push(updated.id);
+            notes.push(`Finding ${updated.id} already existed; merged evidence instead of duplicating it.`);
+            continue;
+          }
+        }
       }
+
       const finding = this.store.createFinding({
         projectId: discovery.project.id,
         statement: parsed.statement,
@@ -643,19 +725,54 @@ export class MasterMcpService {
         now,
       });
       findingIds.push(finding.id);
+      openFindingCandidates.push({
+        id: finding.id,
+        text: finding.statement,
+        detail: finding.evidence.join(' '),
+        subsystem: finding.subsystem,
+      });
     }
 
     // ---------------------------------------------------------------------
     // Bugs
     // ---------------------------------------------------------------------
     const bugsCreated: string[] = [];
+    const bugCandidates: DedupExisting[] = this.store
+      .listBugs(discovery.project.id, { limit: 400 })
+      .map((bug) => ({
+        id: bug.id,
+        text: bug.title,
+        detail: [bug.observed, bug.expected, bug.reproduction].filter(Boolean).join(' '),
+        subsystem: bug.subsystem,
+      }));
     for (const bugInput of input.bugsFound ?? []) {
       const parsed = normalizeBug(bugInput);
       if (!parsed) continue;
-      const existing = this.store.findBugByTitle(discovery.project.id, parsed.title);
-      if (existing) {
-        notes.push(`Bug "${truncate(parsed.title, 60)}" already exists (${existing.id}); not duplicated.`);
-        continue;
+      const duplicate = findDuplicate(
+        {
+          text: parsed.title,
+          detail: [parsed.observed, parsed.expected, parsed.reproduction].filter(Boolean).join(' '),
+          subsystem: parsed.subsystem ?? resolvedSubsystem,
+        },
+        bugCandidates,
+      );
+      if (duplicate) {
+        if (duplicate.verdict === 'borderline') {
+          notes.push(`Bug "${truncate(parsed.title, 60)}": ${duplicate.reason}.`);
+        } else {
+          const existing = this.store.getBug(duplicate.id);
+          if (existing) {
+            // Merge what the new report adds; the existing status stays put.
+            const updated = this.store.updateBug(existing.id, {
+              evidence: dedupe([...existing.evidence, ...parsed.evidence]),
+              files: dedupe([...existing.files, ...parsed.files]),
+              now,
+            });
+            bugsCreated.push(updated.id);
+            notes.push(`Bug ${updated.id} already existed; merged evidence instead of duplicating it.`);
+            continue;
+          }
+        }
       }
       const bug = this.store.createBug({
         projectId: discovery.project.id,
@@ -671,27 +788,32 @@ export class MasterMcpService {
         now,
       });
       bugsCreated.push(bug.id);
+      bugCandidates.push({
+        id: bug.id,
+        text: bug.title,
+        detail: [bug.observed, bug.expected, bug.reproduction].filter(Boolean).join(' '),
+        subsystem: bug.subsystem,
+      });
     }
 
     const bugsUpdated: string[] = [];
-    for (const reference of dedupe(input.bugsResolved)) {
-      const bug =
-        this.store.getBug(reference) ?? this.store.findBugByTitle(discovery.project.id, reference) ?? null;
-      if (!bug) {
-        notes.push(`Could not resolve bug "${truncate(reference, 60)}"; nothing was recorded for it.`);
-        continue;
-      }
-      const verified = classification.status === 'verified';
+    for (const bug of bugsToEvaluate) {
+      const verdict = bugVerdicts.get(bug.id) ?? { satisfied: false, reason: null };
+      const verified = verdict.satisfied && classification.status !== 'failed';
       const status = verified ? 'fixed_verified' : 'fix_claimed';
       const updated = this.store.updateBug(bug.id, {
         status,
         resolvedAt: verified ? now : null,
+        taskId: task.id,
         now,
       });
       bugsUpdated.push(updated.id);
-      if (!verified) {
+      if (verified) {
+        notes.push(`Bug ${updated.id} marked fixed_verified: ${verdict.reason ?? 'bug-specific evidence provided'}.`);
+      } else {
         notes.push(
-          `Bug ${updated.id} marked fix_claimed, not fixed_verified: no passing command or evidence was provided.`,
+          `Bug ${updated.id} marked fix_claimed, not fixed_verified: the evidence does not reference this bug ` +
+            '(name it, run its regression check, or cover its title).',
         );
       }
     }
@@ -701,15 +823,31 @@ export class MasterMcpService {
     // ---------------------------------------------------------------------
     const followUps: string[] = [];
     const followUpLabels: string[] = [];
+    const openTaskCandidates = (): DedupExisting[] =>
+      this.store
+        .listTasks(discovery.project.id, { limit: 200 })
+        .filter((candidate) => needsWork(candidate))
+        .map((candidate) => ({
+          id: candidate.id,
+          text: candidate.title,
+          detail: candidate.description,
+          subsystem: candidate.subsystem,
+        }));
     for (const followUpInput of input.followUp ?? []) {
       const parsed = normalizeFollowUp(followUpInput);
       if (!parsed) continue;
-      const existingOpen = this.store
-        .listTasks(discovery.project.id, { limit: 200 })
-        .find((candidate) => needsWork(candidate) && sameReference(candidate.title, parsed.title));
-      if (existingOpen) {
-        notes.push(`Follow-up "${truncate(parsed.title, 60)}" already exists as ${existingOpen.id}.`);
+      const candidate = {
+        text: parsed.title,
+        detail: parsed.description,
+        subsystem: parsed.subsystem ?? resolvedSubsystem,
+      };
+      const duplicate = findDuplicate(candidate, openTaskCandidates());
+      if (duplicate?.verdict === 'duplicate') {
+        notes.push(`Follow-up "${truncate(parsed.title, 60)}": ${duplicate.reason}; not duplicated.`);
         continue;
+      }
+      if (duplicate) {
+        notes.push(`Follow-up "${truncate(parsed.title, 60)}": ${duplicate.reason}.`);
       }
       const followUp = this.store.createTask({
         projectId: discovery.project.id,
@@ -824,6 +962,7 @@ export class MasterMcpService {
         task: updatedTask,
         verificationStatus: classification.status,
         handoff,
+        coverage: classification.coverage,
       }),
       taskId: updatedTask.id,
       taskStatus: updatedTask.status,
@@ -909,13 +1048,39 @@ export class MasterMcpService {
     });
   }
 
-  private findFindingByStatement(projectId: string, statement: string): Finding | null {
-    const needle = statement.trim().toLowerCase();
-    return (
-      this.store
-        .listFindings(projectId, { limit: 400 })
-        .find((finding) => finding.statement.trim().toLowerCase() === needle) ?? null
-    );
+  /**
+   * Collect every bug a completion speaks to.
+   *
+   * That is the bugs it lists in `bugs_resolved` plus any bug previously
+   * claimed fixed by this same task: re-checking those on later passes is what
+   * lets a fix_claimed bug become fixed_verified without the agent having to
+   * re-list it.
+   */
+  private collectBugsToEvaluate(
+    projectId: string,
+    taskId: string,
+    references: readonly string[],
+    notes: string[],
+  ): Bug[] {
+    const out: Bug[] = [];
+    const seen = new Set<string>();
+    for (const reference of references) {
+      const bug = this.store.getBug(reference) ?? this.store.findBugByTitle(projectId, reference) ?? null;
+      if (!bug || bug.projectId !== projectId) {
+        notes.push(`Could not resolve bug "${truncate(reference, 60)}"; nothing was recorded for it.`);
+        continue;
+      }
+      if (seen.has(bug.id)) continue;
+      seen.add(bug.id);
+      out.push(bug);
+    }
+    for (const bug of this.store.listBugsForTask(projectId, taskId)) {
+      if (seen.has(bug.id) || bug.status !== 'fix_claimed') continue;
+      seen.add(bug.id);
+      out.push(bug);
+      notes.push(`Re-checking bug ${bug.id}, whose fix was claimed by this task but never verified.`);
+    }
+    return out;
   }
 
   // -------------------------------------------------------------------------
@@ -1047,33 +1212,155 @@ export class MasterMcpService {
 
     switch (kind) {
       case 'decision': {
-        const decision = this.store.createDecision({
-          projectId: project.id,
-          statement: body,
-          rationale: input.rationale ?? null,
-          subsystem,
-          alternatives: dedupe(input.alternatives),
-          files,
-          commits: dedupe(input.commits),
-          source: 'master_record',
-          now,
+        if (input.replaces || input.deactivate) {
+          throw usageError(
+            '"replaces" and "deactivate" apply to constraints, not decisions.',
+            'Use "supersedes" to replace one decision with another.',
+          );
+        }
+        const supersedesId = input.supersedes?.trim() || null;
+        const superseded = supersedesId ? this.requireActiveDecision(project, supersedesId) : null;
+
+        const duplicate = findDuplicate(
+          { text: body, detail: input.rationale ?? null, subsystem },
+          this.store
+            .listDecisions(project.id, { activeOnly: false, limit: 400 })
+            .filter((candidate) => candidate.id !== superseded?.id)
+            .map((candidate) => ({
+              id: candidate.id,
+              text: candidate.statement,
+              detail: candidate.rationale,
+              subsystem: candidate.subsystem,
+              inactive: candidate.status !== 'active',
+            })),
+        );
+        if (duplicate?.verdict === 'duplicate') {
+          const existing = this.store.getDecision(duplicate.id);
+          if (existing) {
+            const merged = this.store.updateDecision(existing.id, {
+              files: mergeStrings(existing.files, files),
+              commits: mergeStrings(existing.commits, dedupe(input.commits)),
+              now,
+            });
+            this.afterWrite(project, 'record', `decision: merged into ${merged.id}`, { id: merged.id }, now);
+            return {
+              text: `Decision ${merged.id} already covers this (${duplicate.reason}); merged files/commits instead of duplicating it.\n`,
+              id: merged.id,
+              kind,
+              projectSlug: project.slug,
+            };
+          }
+        }
+        if (duplicate) {
+          // borderline: recorded anyway, with the similarity called out
+        }
+
+        const decision = this.store.transaction(() => {
+          const created = this.store.createDecision({
+            projectId: project.id,
+            statement: body,
+            rationale: input.rationale ?? null,
+            subsystem,
+            alternatives: dedupe(input.alternatives),
+            files,
+            commits: dedupe(input.commits),
+            source: 'master_record',
+            now,
+          });
+          if (superseded) this.store.supersedeDecision(superseded.id, created.id, now);
+          return created;
         });
         this.afterWrite(project, 'record', `decision: ${truncate(body, 100)}`, { id: decision.id }, now);
-        return { text: `Recorded decision ${decision.id}.\n${decision.statement}\n`, id: decision.id, kind, projectSlug: project.slug };
+        const supersedeNote = superseded
+          ? `\nSuperseded decision ${superseded.id}; it stays searchable and exportable but is no longer active.\n`
+          : '';
+        const duplicateNote = duplicate ? `\nNote: ${duplicate.reason}.\n` : '';
+        return {
+          text: `Recorded decision ${decision.id}.\n${decision.statement}${supersedeNote}${duplicateNote}`,
+          id: decision.id,
+          kind,
+          projectSlug: project.slug,
+        };
       }
       case 'constraint': {
-        const constraint = this.store.createConstraint({
-          projectId: project.id,
-          statement: body,
-          subsystem,
-          severity: parseSeverity(input.severity) ?? 'medium',
-          files,
-          source: 'master_record',
-          now,
+        if (input.supersedes) {
+          throw usageError(
+            '"supersedes" applies to decisions, not constraints.',
+            'Use "replaces" to replace a constraint, or "deactivate" to retire one without a replacement.',
+          );
+        }
+        const replacesId = input.replaces?.trim() || null;
+        const deactivateId = input.deactivate?.trim() || null;
+        if (replacesId && deactivateId) {
+          throw usageError(
+            '"replaces" and "deactivate" are alternatives; pass only one.',
+            'Use "deactivate" when the invariant no longer applies and nothing replaces it.',
+          );
+        }
+
+        // Deactivation without replacement: the body is the reason.
+        if (deactivateId && !replacesId) {
+          const retired = this.requireActiveConstraint(project, deactivateId);
+          this.store.deactivateConstraint(retired.id, now);
+          this.afterWrite(project, 'record', `constraint: deactivated ${retired.id}`, { id: retired.id }, now);
+          return {
+            text: `Deactivated constraint ${retired.id}.\nReason: ${body}\nIt stays searchable and exportable but no longer appears as preflight guidance.\n`,
+            id: retired.id,
+            kind,
+            projectSlug: project.slug,
+          };
+        }
+
+        const replaced = replacesId ? this.requireActiveConstraint(project, replacesId) : null;
+        const duplicate = findDuplicate(
+          { text: body, subsystem },
+          this.store
+            .listConstraints(project.id, { activeOnly: false, limit: 400 })
+            .filter((candidate) => candidate.id !== replaced?.id)
+            .map((candidate) => ({
+              id: candidate.id,
+              text: candidate.statement,
+              subsystem: candidate.subsystem,
+              inactive: !candidate.active,
+            })),
+        );
+        if (duplicate?.verdict === 'duplicate') {
+          const existing = this.store.getConstraint(duplicate.id);
+          if (existing) {
+            const merged = this.store.updateConstraint(existing.id, {
+              files: mergeStrings(existing.files, files),
+              now,
+            });
+            this.afterWrite(project, 'record', `constraint: merged into ${merged.id}`, { id: merged.id }, now);
+            return {
+              text: `Constraint ${merged.id} already covers this (${duplicate.reason}); merged files instead of duplicating it.\n`,
+              id: merged.id,
+              kind,
+              projectSlug: project.slug,
+            };
+          }
+        }
+
+        const constraint = this.store.transaction(() => {
+          const created = this.store.createConstraint({
+            projectId: project.id,
+            statement: body,
+            subsystem,
+            severity: parseSeverity(input.severity) ?? 'medium',
+            files,
+            source: 'master_record',
+            now,
+          });
+          if (replaced) this.store.replaceConstraint(replaced.id, created.id, now);
+          return created;
         });
         this.afterWrite(project, 'record', `constraint: ${truncate(body, 100)}`, { id: constraint.id }, now);
+        const replaceNote = replaced
+          ? `\nReplaced constraint ${replaced.id}; it stays searchable and exportable but no longer appears as preflight guidance.\n`
+          : '';
+        const duplicateNote = duplicate ? `\nNote: ${duplicate.reason}.\n` : '';
         return {
-          text: `Recorded ${constraint.severity} constraint ${constraint.id}.\n${constraint.statement}\n`,
+          text: `Recorded ${constraint.severity} constraint ${constraint.id}.\n${constraint.statement}${replaceNote}${duplicateNote}`,
           id: constraint.id,
           kind,
           projectSlug: project.slug,
@@ -1081,9 +1368,41 @@ export class MasterMcpService {
       }
       case 'bug': {
         const severity = parseSeverity(input.severity) ?? 'medium';
+        const title = truncate(body, 200);
+        const duplicate = findDuplicate(
+          {
+            text: title,
+            detail: [input.observed, input.expected, input.reproduction].filter(Boolean).join(' '),
+            subsystem,
+          },
+          this.store.listBugs(project.id, { limit: 400 }).map((candidate) => ({
+            id: candidate.id,
+            text: candidate.title,
+            detail: [candidate.observed, candidate.expected, candidate.reproduction].filter(Boolean).join(' '),
+            subsystem: candidate.subsystem,
+          })),
+        );
+        if (duplicate?.verdict === 'duplicate') {
+          const existing = this.store.getBug(duplicate.id);
+          if (existing) {
+            const merged = this.store.updateBug(existing.id, {
+              evidence: mergeStrings(existing.evidence, evidence),
+              files: mergeStrings(existing.files, files),
+              commits: mergeStrings(existing.commits, dedupe(input.commits)),
+              now,
+            });
+            this.afterWrite(project, 'record', `bug: merged into ${merged.id}`, { id: merged.id }, now);
+            return {
+              text: `Bug ${merged.id} already matches this report (${duplicate.reason}); merged evidence/files/commits into it.\n`,
+              id: merged.id,
+              kind,
+              projectSlug: project.slug,
+            };
+          }
+        }
         const bug = this.store.createBug({
           projectId: project.id,
-          title: truncate(body, 200),
+          title,
           severity,
           status: 'open',
           subsystem,
@@ -1096,8 +1415,9 @@ export class MasterMcpService {
           now,
         });
         this.afterWrite(project, 'record', `bug: ${truncate(body, 100)}`, { id: bug.id }, now);
+        const duplicateNote = duplicate ? `\nNote: ${duplicate.reason}.\n` : '';
         return {
-          text: `Recorded ${severity} bug ${bug.id}.\n${bug.title}\nIt will appear as a preflight hazard for matching tasks.\n`,
+          text: `Recorded ${severity} bug ${bug.id}.\n${bug.title}\nIt will appear as a preflight hazard for matching tasks.${duplicateNote}\n`,
           id: bug.id,
           kind,
           projectSlug: project.slug,
@@ -1108,6 +1428,36 @@ export class MasterMcpService {
         const requested = parseConfidence(input.confidence) ?? (kind === 'hypothesis' ? 'hypothesis' : 'suspected');
         const symbols = dedupe(input.symbols);
         const guard = guardConfidence({ requested, evidence, files, symbols });
+        const duplicate = findDuplicate(
+          { text: body, detail: evidence.join(' '), subsystem },
+          this.store.listFindings(project.id, { limit: 400 }).map((candidate) => ({
+            id: candidate.id,
+            text: candidate.statement,
+            detail: candidate.evidence.join(' '),
+            subsystem: candidate.subsystem,
+          })),
+        );
+        if (duplicate?.verdict === 'duplicate') {
+          const existing = this.store.getFinding(duplicate.id);
+          if (existing) {
+            // Confidence never falls: the merge keeps whichever is stronger.
+            const keepExisting = isConfidenceAtLeast(existing.confidence, guard.confidence);
+            const merged = this.store.updateFinding(existing.id, {
+              confidence: keepExisting ? existing.confidence : guard.confidence,
+              evidence: mergeStrings(existing.evidence, evidence),
+              files: mergeStrings(existing.files, files),
+              symbols: mergeStrings(existing.symbols, symbols),
+              now,
+            });
+            this.afterWrite(project, 'record', `finding: merged into ${merged.id}`, { id: merged.id }, now);
+            return {
+              text: `Finding ${merged.id} already exists at confidence "${merged.confidence}" (${duplicate.reason}); merged evidence instead of duplicating it.\n`,
+              id: merged.id,
+              kind,
+              projectSlug: project.slug,
+            };
+          }
+        }
         const finding = this.store.createFinding({
           projectId: project.id,
           statement: body,
@@ -1121,17 +1471,40 @@ export class MasterMcpService {
         });
         this.afterWrite(project, 'record', `finding: ${truncate(body, 100)}`, { id: finding.id }, now);
         const reason = guard.reason ? `\nNote: ${guard.reason}` : '';
+        const duplicateNote = duplicate ? `\nNote: ${duplicate.reason}.` : '';
         return {
-          text: `Recorded finding ${finding.id} at confidence "${finding.confidence}".\n${finding.statement}${reason}\n`,
+          text: `Recorded finding ${finding.id} at confidence "${finding.confidence}".\n${finding.statement}${reason}${duplicateNote}\n`,
           id: finding.id,
           kind,
           projectSlug: project.slug,
         };
       }
       case 'todo': {
+        const title = truncate(body, 200);
+        const duplicate = findDuplicate(
+          { text: title, detail: input.rationale ?? null, subsystem },
+          this.store
+            .listTasks(project.id, { limit: 200 })
+            .filter((candidate) => needsWork(candidate))
+            .map((candidate) => ({
+              id: candidate.id,
+              text: candidate.title,
+              detail: candidate.description,
+              subsystem: candidate.subsystem,
+            })),
+        );
+        if (duplicate?.verdict === 'duplicate') {
+          this.afterWrite(project, 'record', `todo: matched ${duplicate.id}`, { id: duplicate.id }, now);
+          return {
+            text: `Todo ${duplicate.id} already covers this (${duplicate.reason}); not duplicated.\n`,
+            id: duplicate.id,
+            kind,
+            projectSlug: project.slug,
+          };
+        }
         const task = this.store.createTask({
           projectId: project.id,
-          title: truncate(body, 200),
+          title,
           description: input.rationale ?? null,
           priority: parsePriority(input.priority) ?? 'P2',
           status: 'todo',
@@ -1142,8 +1515,9 @@ export class MasterMcpService {
           now,
         });
         this.afterWrite(project, 'record', `todo: ${truncate(body, 100)}`, { id: task.id }, now);
+        const duplicateNote = duplicate ? `\nNote: ${duplicate.reason}.\n` : '';
         return {
-          text: `Recorded ${task.priority} task ${task.id}.\n${task.title}\nIt will surface as a follow-up in matching briefs.\n`,
+          text: `Recorded ${task.priority} task ${task.id}.\n${task.title}\nIt will surface as a follow-up in matching briefs.${duplicateNote}\n`,
           id: task.id,
           kind,
           projectSlug: project.slug,
@@ -1213,6 +1587,42 @@ export class MasterMcpService {
   ): void {
     this.store.touchProject(project.id, now);
     this.store.recordActivity({ projectId: project.id, kind, summary, payload, source: 'master_record', now });
+  }
+
+  /** Resolve a decision that is still active and belongs to this project. */
+  private requireActiveDecision(project: Project, id: string): Decision {
+    const decision = this.store.getDecision(id);
+    if (!decision || decision.projectId !== project.id) {
+      throw notFoundError(
+        `No decision "${id}" exists in project "${project.slug}".`,
+        'Pass the id of a decision in this project (see master_search).',
+      );
+    }
+    if (decision.status !== 'active') {
+      throw usageError(
+        `Decision ${id} is already ${decision.status}; it cannot be superseded again.`,
+        'Record the new decision without "supersedes", or target the active decision it replaced.',
+      );
+    }
+    return decision;
+  }
+
+  /** Resolve a constraint that is still active and belongs to this project. */
+  private requireActiveConstraint(project: Project, id: string): Constraint {
+    const constraint = this.store.getConstraint(id);
+    if (!constraint || constraint.projectId !== project.id) {
+      throw notFoundError(
+        `No constraint "${id}" exists in project "${project.slug}".`,
+        'Pass the id of a constraint in this project (see master_search).',
+      );
+    }
+    if (!constraint.active) {
+      throw usageError(
+        `Constraint ${id} is already inactive; it cannot be replaced or deactivated again.`,
+        'Record the new constraint without "replaces", or target the active constraint it replaced.',
+      );
+    }
+    return constraint;
   }
 
   // -------------------------------------------------------------------------
@@ -1460,11 +1870,23 @@ function renderCompletion(input: {
   task: Task;
   verificationStatus: VerificationStatus;
   handoff: Handoff;
+  coverage?: VerificationCoverage | null;
 }): string {
   const lines: string[] = [];
+  const coverage = input.coverage
+    ? `, coverage: ${input.coverage.satisfied}/${input.coverage.total}`
+    : '';
   lines.push('RECORDED');
-  lines.push(`task ${input.task.id} → ${input.task.status} (verification: ${input.verificationStatus})`);
+  lines.push(`task ${input.task.id} → ${input.task.status} (verification: ${input.verificationStatus}${coverage})`);
   lines.push(`title: ${input.task.title}`);
+  if (input.coverage && input.coverage.total > 0) {
+    const missing = missingRequirements(input.coverage);
+    if (missing.length > 0) {
+      lines.push(
+        `uncovered: ${missing.slice(0, 4).map((requirement) => truncate(requirement, 90)).join('; ')}`,
+      );
+    }
+  }
   if (input.task.affectedFiles.length > 0) {
     lines.push(`files: ${input.task.affectedFiles.join(', ')}`);
   }

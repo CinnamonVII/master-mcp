@@ -55,7 +55,7 @@ master-mcp doctor
 MASTER-MCP
 version: 1.0.0
 database: /home/you/.local/share/master-mcp/master-mcp.db
-schema version: 1
+schema version: 2
 projects: 0
 ```
 
@@ -110,7 +110,7 @@ $ master-mcp complete --task-id tsk_tn4pek4a9803 \
       --discovery-confidence statically_supported \
       --follow-up "Audit the support tooling for the same missing ownership check"
 RECORDED
-task tsk_tn4pek4a9803 → verified_done (verification: verified)
+task tsk_tn4pek4a9803 → verified_done (verification: verified, coverage: 1/1)
 title: Fix the incorrect ownership check in the industry-offer list
 files: src/industry/offer.ts, tests/offer.test.ts
 handoff: hnd_tn4pf25d1b12
@@ -281,7 +281,9 @@ master-mcp doctor              Database location, schema version, projects
 
 Common flags: `--project <slug>` (usually inferred), `--repo <path>` (defaults
 to the working directory), `--json` for machine-readable output, `--db <path>`
-to override the database, `-h/--help` on every command.
+to override the database, `-h/--help` on every command. Per-command options
+include `--mode` and `--max-tokens` on `context` and the lifecycle flags
+(`--supersedes`, `--replaces`, `--deactivate`) on `record`.
 
 Exit codes: `0` success, `1` error, `2` usage error.
 
@@ -320,28 +322,100 @@ context:
 - `project` — slug used to group memory across repositories.
 - `subsystems` — names the ranking engine can match against task wording; the
   more the brief knows, the better it ranks.
-- `verification.*` — commands the brief puts in the verification plan.
+- `verification.test_command` / `lint_command` / `build_command` — the checks a
+  completion is expected to cover when the task declares no requirements of its
+  own. Only what you configure counts: a project that sets `test_command` alone
+  is judged against the test command. `extra_checks` are shown as suggestions
+  and never become requirements.
 - `context.recent_commits` (default 10, max 100) and
-  `context.max_brief_tokens` (default 2000, range 400–12000) — brief size.
+  `context.max_brief_tokens` (default per mode: auto 2000, `re` 3000,
+  `deep` 4000; explicit values are clamped to 400–12000) — brief size. An
+  explicit `--max-tokens`/`max_tokens` value wins over the config, which wins
+  over the mode default; no setting can exceed the 12000-token ceiling.
 
 A malformed config produces a warning in the brief, never a crash.
 
 ## Trust model
 
-master-mcp records what it can defend:
+master-mcp records what it can defend. Every rule below is deterministic: text
+normalisation, command and identifier matching — no LLM judgement, no
+embeddings, no scoring that could drift between runs.
 
-- A completion without passing evidence ends as `implementation_done` with
-  verification `none`, `claimed` or `partial` — never `verified_done`.
-- `verified_done` requires a passing command with a command line or evidence.
-- A resolved bug becomes `fix_claimed` unless the resolution is verified, in
-  which case it becomes `fixed_verified`.
-- Findings carry a confidence ladder — `hypothesis`, `suspected`,
-  `statically_supported`, `runtime_observed`, `runtime_confirmed` — and claims
-  above `statically_supported` are downgraded unless evidence is recorded.
-  Reverse-engineering briefs separate *established (runtime evidence on record)*
-  from *unverified (do not treat as fact)*.
-- Briefs warn when the repository moved past the last recorded observation, or
-  when the branch changed since the cached handoff.
+**Requirement-aware verification.** A completion is judged against the task's
+declared requirements (a todo's `verification_requirements`) or, when it
+declares none, the configured `test_command`/`lint_command`/`build_command`
+(`docs` and `investigation` tasks are exempt). Each requirement is matched by
+command or normalised text against the checks claimed in *that* completion:
+
+- Full coverage → `verified` → `verified_done`.
+- Partial coverage → `partial` → `implementation_done`, with the uncovered
+  requirements named.
+- A failing check → `failed`; no checks at all → `none`.
+
+The recording output and the brief both show the coverage:
+
+```
+task tsk_… → verified_done (verification: verified, coverage: 1/1)
+task tsk_… → implementation_done (verification: partial, coverage: 1/3)
+uncovered: npm run lint; npm run build
+requirement coverage:
+- ✓ npm test
+- ✗ npm run lint
+- ✗ npm run build
+```
+
+Coverage in the brief is cumulative over the task's linked verifications, but
+each completion is judged on the checks that call re-lists — re-list the
+commands you ran when completing the same task again. A completion without
+passing evidence never ends `verified_done`.
+
+**Bug-specific evidence.** Bug status moves `open` → `investigating` →
+`fix_claimed` → `fixed_verified`. A resolved bug becomes `fix_claimed`; it
+becomes `fixed_verified` only when the resolution carries evidence specific to
+that bug — a reference to the bug id, a check covering the bug's title terms,
+or one of the task's regression requirements. Generic configured commands
+(`npm test`,
+`npm run build`) do not turn a fix into `fixed_verified` on their own. Bugs
+linked to a task are re-evaluated when that task is completed again, even if
+the completion does not re-list them.
+
+**Confidence ladder for findings.** `hypothesis`, `suspected`,
+`statically_supported`, `runtime_observed`, `runtime_confirmed` — claims above
+`statically_supported` are downgraded unless evidence is recorded.
+Reverse-engineering briefs separate *established (runtime evidence on record)*
+from *unverified (do not treat as fact)*.
+
+**Lifecycle.** A decision can supersede an active decision
+(`--supersedes`/`supersedes`) and a constraint can replace one
+(`--replaces`/`replaces`) or retire one (`--deactivate`/`deactivate`).
+Superseded and inactive records disappear from the brief's active memory but
+stay in search and export with their links intact; invalid or cross-project
+references are rejected. Lifecycle transitions are transactional.
+
+**Near-duplicate protection.** Before storing a decision, constraint, finding,
+bug or follow-up, master-mcp compares it with existing records and merges
+evidence, files, symbols and commits instead of stacking a second copy.
+Borderline matches are still stored, with a note; confidence is never
+downgraded, and superseded/inactive records are never silently reactivated.
+
+**Conflict warnings.** The brief warns when active durable records contradict
+each other: decisions or constraints with opposite polarity over the same
+terms, duplicate bugs with incompatible statuses, dangling lifecycle
+references. Superseded and inactive records never trigger a conflict warning.
+
+**Repository drift.** Briefs warn when the repository moved past the last
+recorded observation or the branch changed since the cached handoff. Ranking
+uses `updatedAt ?? createdAt`, so lifecycle changes reorder history
+deterministically.
+
+### When to use `read_only`
+
+`master_context --mode read_only` (MCP `mode: "read_only"`) returns the brief
+without registering the project, creating a task, refreshing repository
+observation or writing activity — safe for triage, exploration and questions
+where nothing will be recorded. The project must already be known to the
+database, otherwise the call returns `NOT_FOUND` with a hint. Use the default
+`auto` for normal passes.
 
 ## Storage and backup
 
@@ -351,6 +425,13 @@ The database is one SQLite file (WAL mode, FTS5 index, versioned migrations):
 2. `MASTER_MCP_HOME/master-mcp.db`
 3. `XDG_DATA_HOME/master-mcp/master-mcp.db`
 4. `~/.local/share/master-mcp/master-mcp.db`
+
+Schema upgrades run automatically when an older database is opened. Each
+migration executes inside a single transaction (v1 → v2 adds verification
+coverage and lifecycle columns); if anything fails, the transaction rolls back
+and the open fails with the migration error, leaving the file untouched.
+Snapshots preserve lifecycle links (`supersededBy`, `replacedBy`), bug↔task
+links and per-requirement verification coverage.
 
 Export is both a human document and a lossless backup:
 
@@ -385,8 +466,13 @@ npm run check         # typecheck + tests + build
 Tests run the TypeScript sources directly (Node native type stripping), use
 temporary databases and real temporary git repositories, and require no
 network. The suite includes an MCP client/server round trip over the official
-SDK transport, a spawned-binary CLI cycle, persistence across restarts, and
-export/import round trips.
+SDK transport, a spawned-binary CLI cycle, persistence across restarts,
+requirement-coverage and bug-evidence checks, dedup and conflict handling,
+transactional v1 → v2 migrations, export/import round trips, and an end-to-end
+offer-service acceptance cycle.
+
+CI runs `npm ci` and `npm run check` on Node 22, 24 and 26
+(`.github/workflows/ci.yml`).
 
 Layout:
 

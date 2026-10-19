@@ -75,6 +75,23 @@ describe('interpretConfig', () => {
     const config = interpretConfig({ context: { max_brief_tokens: 10, recent_commits: 5000 } }, null);
     assert.equal(config.context.maxBriefTokens, 400);
     assert.equal(config.context.recentCommits, 100);
+    assert.equal(config.context.maxBriefTokensSet, true);
+    assert.equal(interpretConfig({ context: { max_brief_tokens: 99_999 } }, null).context.maxBriefTokens, 12_000);
+  });
+
+  it('marks the token budget as explicit only when it was configured', () => {
+    assert.equal(interpretConfig(null, null).context.maxBriefTokensSet, false);
+    assert.equal(
+      interpretConfig({ context: { max_brief_tokens: 5000 } }, null).context.maxBriefTokensSet,
+      true,
+    );
+    assert.equal(interpretConfig({ context: { maxBriefTokens: 5000 } }, null).context.maxBriefTokensSet, true);
+
+    // An explicit value in one file must not leak into the shared defaults used
+    // by the next load.
+    const fresh = interpretConfig({ goal: 'A different project' }, null);
+    assert.equal(fresh.context.maxBriefTokensSet, false);
+    assert.equal(fresh.context.maxBriefTokens, 2000);
   });
 
   it('ignores non-string scalars for string fields', () => {

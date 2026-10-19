@@ -29,8 +29,9 @@ export const SERVER_INSTRUCTIONS = [
   'identity, task interpretation, critical constraints, relevant history, risks, verification requirements and a',
   'single recommended next action — no extra calls needed. Do the work with your normal filesystem/git/shell tools',
   '(master-mcp never edits code, runs tests or commits), then call master_complete once to persist the result.',
-  'Use master_search only for unusual historical detail, master_status when no task exists yet, and master_record to',
-  'store a durable engineering fact (decision, constraint, bug, finding, todo).',
+  'Verification is requirement-aware: partial coverage stays implementation_done, and bugs become fixed_verified only',
+  'with bug-specific evidence. Use master_search only for unusual historical detail, master_status when no task exists',
+  'yet, and master_record to store a durable engineering fact (decision, constraint, bug, finding, todo).',
 ].join(' ');
 
 const verificationItemSchema = z.object({
@@ -135,6 +136,13 @@ export function createServer(options: CreateServerOptions = {}): McpServer {
           .optional()
           .describe('auto (default): normal pass. read_only: nothing is written. deep: wider history. re: reverse-engineering framing.'),
         refresh: z.boolean().optional().describe('Re-read repository metadata even if HEAD looks unchanged.'),
+        max_tokens: z
+          .number()
+          .int()
+          .min(400)
+          .max(12000)
+          .optional()
+          .describe('Override the brief token budget for this call (default 2000; deep 4000; re 3000).'),
       },
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
     },
@@ -146,6 +154,7 @@ export function createServer(options: CreateServerOptions = {}): McpServer {
         affectedFiles: args.affected_files ?? null,
         mode: args.mode ?? null,
         refresh: args.refresh ?? null,
+        maxTokens: args.max_tokens ?? null,
       });
       return result.text;
     }),
@@ -157,8 +166,11 @@ export function createServer(options: CreateServerOptions = {}): McpServer {
       title: 'Record the result of a work pass',
       description:
         'Call once after finishing work. Records the outcome into persistent project memory: task state, verification ' +
-        'history, findings, bugs, follow-ups and a handoff for the next agent. Claims without evidence are recorded as ' +
-        'unverified — pass tests_run (with a command or evidence) for a task to be marked verified_done.',
+        'history, findings, bugs, follow-ups and a handoff for the next agent. ' +
+        'Verification is judged against the task\'s declared requirements (or, when it declares none, the configured ' +
+        'test/lint/build commands): only full coverage is `verified`; partial coverage stays `implementation_done`. ' +
+        'A bug is `fixed_verified` only with bug-specific evidence — evidence that names the bug, matches its title, or ' +
+        'satisfies one of the task\'s regression requirements; anything else is `fix_claimed`.',
       inputSchema: {
         summary: z.string().describe('What was actually done, in one or two sentences.'),
         project: z.string().optional(),
@@ -175,7 +187,7 @@ export function createServer(options: CreateServerOptions = {}): McpServer {
         blockers: z.array(z.string()).optional().describe('Anything that stopped the work. Blocks the task.'),
         follow_up: z.array(followUpSchema).optional().describe('Work that should happen next; becomes dependent tasks.'),
         bugs_found: z.array(bugSchema).optional(),
-        bugs_resolved: z.array(z.string()).optional().describe('Bug ids or exact titles. Marked fixed_verified only with passing evidence.'),
+        bugs_resolved: z.array(z.string()).optional().describe('Bug ids or exact titles. Marked fix_claimed unless the evidence is specific to the bug.'),
         subsystems: z.array(z.string()).optional(),
         status: z
           .enum(['todo', 'in_progress', 'implementation_done', 'verified_done', 'blocked', 'cancelled'])
@@ -267,7 +279,10 @@ export function createServer(options: CreateServerOptions = {}): McpServer {
       description:
         'Escape hatch for explicitly recording a decision, constraint, bug, finding/hypothesis, todo, handoff or ' +
         'verification outside the normal work cycle. Prefer master_complete: it records the same kinds of facts ' +
-        'together with task state and evidence.',
+        'together with task state and evidence. Decisions and constraints can be retired here: ' +
+        'record a decision with supersedes=<decision id> to replace an active one, or a constraint with ' +
+        'replaces=<constraint id> (replaced by the new record) or deactivate=<constraint id> (retired with the body ' +
+        'as the reason). Superseded and inactive records stay searchable and exportable.',
       inputSchema: {
         kind: z
           .enum(['decision', 'constraint', 'bug', 'finding', 'hypothesis', 'todo', 'handoff', 'verification'])
@@ -297,6 +312,9 @@ export function createServer(options: CreateServerOptions = {}): McpServer {
         command: z.string().optional().describe('Verifications only.'),
         method: z.string().optional().describe('Verifications only.'),
         result: z.enum(['pass', 'fail', 'partial', 'unknown']).optional().describe('Verifications only.'),
+        supersedes: z.string().optional().describe('Decisions only: id of the active decision this one supersedes.'),
+        replaces: z.string().optional().describe('Constraints only: id of the active constraint this one replaces.'),
+        deactivate: z.string().optional().describe('Constraints only: id of an active constraint to retire, with the body as the reason.'),
       },
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
     },
@@ -325,6 +343,9 @@ export function createServer(options: CreateServerOptions = {}): McpServer {
         command: args.command ?? null,
         method: args.method ?? null,
         result: args.result ?? null,
+        supersedes: args.supersedes ?? null,
+        replaces: args.replaces ?? null,
+        deactivate: args.deactivate ?? null,
       }).text,
     ),
   );

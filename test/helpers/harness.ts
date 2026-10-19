@@ -216,6 +216,7 @@ export function sampleBrief(overrides: Partial<Brief> = {}): Brief {
     findings: [],
     attempts: [],
     verifications: [],
+    coverage: null,
     likelyFiles: [],
     uncommittedFiles: [],
     recentCommits: [],

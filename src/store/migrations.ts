@@ -191,11 +191,32 @@ CREATE VIRTUAL TABLE IF NOT EXISTS memory_fts USING fts5(
 );
 `;
 
+/**
+ * Version 2: requirement-aware verification, bug-specific evidence, constraint
+ * replacement and the bug → claiming-task link.
+ *
+ * Version 1 is frozen: existing databases already recorded version 1, so every
+ * new column must be added here with `ALTER TABLE ... ADD COLUMN`, which is
+ * safe on a populated table.
+ */
+const verificationCoverage = `
+ALTER TABLE verifications ADD COLUMN requirement TEXT;
+ALTER TABLE verifications ADD COLUMN bug_id TEXT;
+ALTER TABLE constraints ADD COLUMN replaced_by TEXT;
+ALTER TABLE bugs ADD COLUMN task_id TEXT;
+CREATE INDEX IF NOT EXISTS idx_bugs_task ON bugs(task_id);
+`;
+
 export const MIGRATIONS: readonly Migration[] = [
   {
     version: 1,
     name: 'initial_schema',
     up: (db) => db.exec(initialSchema),
+  },
+  {
+    version: 2,
+    name: 'verification_coverage_and_lifecycle',
+    up: (db) => db.exec(verificationCoverage),
   },
 ];
 

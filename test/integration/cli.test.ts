@@ -143,7 +143,7 @@ describe('CLI', () => {
       ]);
       assert.equal(complete.code, 0);
       assert.match(complete.stdout, /^RECORDED/);
-      assert.match(complete.stdout, /→ verified_done \(verification: verified\)/);
+      assert.match(complete.stdout, /→ verified_done \(verification: verified, coverage: 1\/1\)/);
 
       const again = await cli(h.dir, ['context', 'Fix the offer ownership check', ...base]);
       assert.match(again.stdout, /previous work:/);

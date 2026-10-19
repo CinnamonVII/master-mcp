@@ -140,6 +140,8 @@ export interface Constraint {
   files: string[];
   source: string | null;
   active: boolean;
+  /** Constraint that replaced (and deactivated) this one, when one did. */
+  replacedBy: string | null;
   createdAt: string;
   updatedAt: string;
 }
@@ -160,6 +162,11 @@ export interface Bug {
   createdAt: string;
   updatedAt: string;
   resolvedAt: string | null;
+  /**
+   * Task whose completion claimed this fix. Used to re-check a `fix_claimed`
+   * bug when later passes on the same task produce bug-specific evidence.
+   */
+  taskId: string | null;
 }
 
 export interface Finding {
@@ -184,6 +191,10 @@ export interface Verification {
   command: string | null;
   result: VerificationResult;
   evidence: string[];
+  /** Declared task requirement this evidence was matched against, when any. */
+  requirement: string | null;
+  /** Bug this evidence was accepted as proving fixed, when any. */
+  bugId: string | null;
   createdAt: string;
 }
 
@@ -301,6 +312,11 @@ export interface MemoryItem {
   severity: Severity | null;
   confidence: Confidence | null;
   verification: VerificationStatus | null;
+  /**
+   * Effective freshness timestamp: `updatedAt ?? createdAt` for records that
+   * carry an update time, creation time for immutable history (handoffs). Used
+   * for both the recency signal and the deterministic tie-break.
+   */
   createdAt: string;
   /** Id of the task this record belongs to, when it belongs to one. */
   taskId: string | null;
@@ -334,6 +350,11 @@ export interface ProjectConfig {
   context: {
     recentCommits: number;
     maxBriefTokens: number;
+    /**
+     * True when `context.max_brief_tokens` was set explicitly in the config
+     * file. Automatic mode limits (deep/re) only apply when it was not.
+     */
+    maxBriefTokensSet: boolean;
   };
   /** Absolute path of the config file, when one was loaded. */
   sourcePath: string | null;

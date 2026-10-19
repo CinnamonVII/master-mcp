@@ -135,7 +135,7 @@ describe('MCP server', () => {
           assert.ok(!complete.isError);
           const recorded = textOf(complete);
           assert.match(recorded, /^RECORDED/);
-          assert.match(recorded, /task tsk_[a-z0-9]+ → verified_done \(verification: verified\)/);
+          assert.match(recorded, /task tsk_[a-z0-9]+ → verified_done \(verification: verified, coverage: 1\/1\)/);
           assert.match(recorded, /handoff: hnd_[a-z0-9]+/);
 
           const decision = await call(link.client, 'master_record', {
