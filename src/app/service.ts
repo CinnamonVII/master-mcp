@@ -30,7 +30,7 @@ import { Store } from '../store/store.ts';
 import { readSnapshot, writeSnapshot } from '../store/transfer.ts';
 import type { Clock } from '../util/time.ts';
 import { isoNow, systemClock } from '../util/time.ts';
-import { MasterMcpError, configError, notFoundError, usageError } from '../util/errors.ts';
+import { MasterMcpError, notFoundError, usageError } from '../util/errors.ts';
 import { loadProjectConfig } from '../config/config.ts';
 import { discoverProject } from '../repo/discovery.ts';
 import { countCommitsBetween, isAncestor } from '../repo/git.ts';
@@ -44,7 +44,7 @@ import {
   parseVerificationResult,
 } from '../domain/vocabulary.ts';
 import { keywords, truncate } from '../util/text.ts';
-import { interpretTask, type ContextMode, type TaskInterpretation } from './interpret.ts';
+import { CONTEXT_MODES, interpretTask, type ContextMode, type TaskInterpretation } from './interpret.ts';
 import { assembleBrief, type Brief } from './assembler.ts';
 import { renderBrief, renderStatus } from './render.ts';
 import { buildStatus, type StatusReport } from './status.ts';
@@ -238,16 +238,14 @@ export interface ServiceOptions {
   database?: DatabaseSync;
 }
 
-const VALID_MODES: readonly ContextMode[] = ['auto', 'read_only', 'deep', 're'];
-
 function parseMode(raw: string | null | undefined): ContextMode {
   if (!raw) return 'auto';
   const needle = raw.trim().toLowerCase().replace(/-/g, '_');
-  const found = VALID_MODES.find((mode) => mode === needle);
+  const found = CONTEXT_MODES.find((mode) => mode === needle);
   if (!found) {
     throw usageError(
       `Unknown mode "${raw}".`,
-      `Valid modes: ${VALID_MODES.join(', ')}.`,
+      `Valid modes: ${CONTEXT_MODES.join(', ')}.`,
     );
   }
   return found;
@@ -1251,7 +1249,7 @@ export class MasterMcpService {
       throw usageError(`Unknown export format "${input.format}".`, 'Valid formats: markdown, json.');
     }
     const project = this.requireProject(input.project ?? null, input.repositoryPath ?? null);
-    const snapshot = readSnapshot(this.store, project);
+    const snapshot = readSnapshot(this.store, project, isoNow(this.clock));
     return {
       format,
       snapshot,
@@ -1482,15 +1480,4 @@ function renderCompletion(input: {
     );
   }
   return `${lines.join('\n')}\n`;
-}
-
-/** Re-exported so adapters can report a project list without touching the store. */
-export function listProjectSummaries(
-  service: MasterMcpService,
-): Array<{ slug: string; name: string; phase: string | null }> {
-  return service.store.listProjects().map((project) => ({
-    slug: project.slug,
-    name: project.name,
-    phase: project.phase,
-  }));
 }

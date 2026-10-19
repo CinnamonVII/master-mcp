@@ -12,7 +12,7 @@
  */
 import type { Bug, Confidence, MemoryItem, Severity, TaskType } from '../domain/models.ts';
 import type { Clock } from '../util/time.ts';
-import { humanAge, recencyScore } from '../util/time.ts';
+import { recencyScore } from '../util/time.ts';
 import { bestPathAffinity, queryCoverage, truncate } from '../util/text.ts';
 import { confidenceRank, priorityWeight, severityWeight } from '../domain/vocabulary.ts';
 import { normalizeTerm } from '../util/text.ts';
@@ -244,11 +244,6 @@ export function rankItems(
     });
 }
 
-/** Compact one-line summary of why an item was selected. */
-export function reasonSummary(scored: ScoredItem): string {
-  return scored.reasons.slice(0, 3).join('; ');
-}
-
 /**
  * Render a bug as a compact, decision-ready line: what is wrong, and how it was
  * observed. Only fields actually recorded are shown.
@@ -264,11 +259,6 @@ export function describeBug(bug: Bug): string {
 /** Human label for a confidence level, used in reverse-engineering output. */
 export function confidenceLabel(confidence: Confidence): string {
   return confidence.replace(/_/g, ' ');
-}
-
-/** Relative age label; re-exported so renderers do not need the clock module. */
-export function ageLabel(iso: string, clock: Clock): string {
-  return humanAge(iso, clock);
 }
 
 /** Strongest severity present in a set, or null when empty. */

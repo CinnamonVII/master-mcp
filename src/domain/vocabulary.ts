@@ -34,7 +34,6 @@ export const CONFIDENCES = [
   'runtime_confirmed',
 ] as const;
 export const VERIFICATION_RESULTS = ['pass', 'fail', 'partial', 'unknown'] as const;
-export const VERIFICATION_STATUSES = ['none', 'claimed', 'partial', 'verified', 'failed'] as const;
 export const MEMORY_KINDS = [
   'task',
   'decision',
@@ -158,6 +157,4 @@ export const parseBugStatus = (raw: unknown): BugStatus | undefined => parseFrom
 export const parseConfidence = (raw: unknown): Confidence | undefined => parseFrom(CONFIDENCES, raw);
 export const parseVerificationResult = (raw: unknown): VerificationResult | undefined =>
   parseFrom(VERIFICATION_RESULTS, raw);
-export const parseVerificationStatus = (raw: unknown): VerificationStatus | undefined =>
-  parseFrom(VERIFICATION_STATUSES, raw);
 export const parseMemoryKind = (raw: unknown): MemoryKind | undefined => parseFrom(MEMORY_KINDS, raw);

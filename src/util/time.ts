@@ -61,8 +61,3 @@ export function humanAge(iso: string | null | undefined, clock: Clock): string {
   return `${(age / 365).toFixed(1)}y ago`;
 }
 
-/** ISO timestamp with second precision, for compact rendering. */
-export function shortTimestamp(iso: string | null | undefined): string {
-  if (!iso) return 'unknown';
-  return iso.replace('T', ' ').replace(/\.\d+Z$/, 'Z').replace(/Z$/, ' UTC');
-}

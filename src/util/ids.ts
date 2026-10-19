@@ -28,11 +28,6 @@ export function newId(kind: IdKind, now: number = Date.now()): string {
   return `${ID_PREFIX[kind]}_${time}${rand}`;
 }
 
-/** True when `value` looks like an id issued by this server for the given kind. */
-export function isIdOfKind(value: string, kind: IdKind): boolean {
-  return new RegExp(`^${ID_PREFIX[kind]}_[a-z0-9]+$`).test(value);
-}
-
 /**
  * Convert arbitrary text into a stable slug usable as a project identifier.
  * Deterministic: the same input always yields the same slug.

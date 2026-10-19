@@ -273,7 +273,10 @@ export function interpretTask(input: InterpretTaskInput): TaskInterpretation {
     }
   }
 
-  const reverseEngineering = isReverseEngineeringTask(task, input.project.phase);
+  // An explicit `re` mode is the strongest signal that the caller is doing
+  // reverse-engineering work, even when the task wording itself is neutral;
+  // otherwise the task vocabulary (and project phase) decides.
+  const reverseEngineering = input.mode === 're' || isReverseEngineeringTask(task, input.project.phase);
   const mode: ContextMode = input.mode && input.mode !== 'auto' ? input.mode : reverseEngineering ? 're' : 'auto';
 
   const inferredFiles =

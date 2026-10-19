@@ -10,15 +10,13 @@
  */
 import type {
   Confidence,
-  Finding,
   Task,
   TaskStatus,
-  Verification,
   VerificationResult,
   VerificationStatus,
 } from '../domain/models.ts';
 import { confidenceRank } from '../domain/vocabulary.ts';
-import { keywords, setOverlap, truncate } from '../util/text.ts';
+import { keywords, setOverlap } from '../util/text.ts';
 
 // ---------------------------------------------------------------------------
 // Matching a task string to an existing record
@@ -260,21 +258,6 @@ export function guardConfidence(input: {
     );
   }
   return { confidence: requested, downgradedFrom: null, reason: null };
-}
-
-// ---------------------------------------------------------------------------
-// Handoff rendering helpers (shared by master_complete's own output)
-// ---------------------------------------------------------------------------
-
-/** One-line description of a stored finding, used in command output. */
-export function describeFinding(finding: Finding): string {
-  return `${finding.id} [${finding.confidence}] ${truncate(finding.statement, 120)}`;
-}
-
-/** One-line description of a stored verification. */
-export function describeVerification(verification: Verification): string {
-  const command = verification.command ? ` via ${verification.command}` : '';
-  return `${verification.id} ${verification.method}${command} → ${verification.result}`;
 }
 
 /** True when a task is in a state that still needs work. */

@@ -10,6 +10,7 @@ import {
   approxTokens,
   bestPathAffinity,
   closestMatch,
+  endSentence,
   keywords,
   normalizeTerm,
   normalizePath,
@@ -127,6 +128,15 @@ describe('formatting helpers', () => {
 
   it('tidy strips a trailing period', () => {
     assert.equal(tidy('Fix the thing.'), 'Fix the thing');
+  });
+
+  it('endSentence adds exactly one period and collapses whitespace', () => {
+    assert.equal(endSentence('isEligible decides visibility'), 'isEligible decides visibility.');
+    assert.equal(endSentence('Already a sentence.'), 'Already a sentence.');
+    assert.equal(endSentence('What?'), 'What?');
+    assert.equal(endSentence('cut short…'), 'cut short…');
+    assert.equal(endSentence('  spaced   out  '), 'spaced out.');
+    assert.equal(endSentence(''), '');
   });
 
   it('normalizePath removes ./ and trailing slashes', () => {

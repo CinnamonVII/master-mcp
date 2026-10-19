@@ -26,7 +26,7 @@ import type {
 import type { ProjectConfig } from '../domain/models.ts';
 import type { Clock } from '../util/time.ts';
 import { humanAge, isoNow } from '../util/time.ts';
-import { truncate } from '../util/text.ts';
+import { endSentence, normalizeTerm, truncate } from '../util/text.ts';
 import {
   CONFIDENCE_CRITERIA,
   CONFIDENCE_PROMOTION,
@@ -38,7 +38,6 @@ import type { ContextMode, InferenceConfidence, TaskInterpretation } from './int
 import { assessRisk } from './interpret.ts';
 import type { RelevanceContext, ScoredItem } from './ranking.ts';
 import { confidenceLabel, describeBug, rankItems, strongestSeverity } from './ranking.ts';
-import { normalizeTerm } from '../util/text.ts';
 
 // ---------------------------------------------------------------------------
 // Brief shape
@@ -462,7 +461,7 @@ function buildApproach(input: {
     const handoff = failedAttempt.item.raw as import('../domain/models.ts').Handoff;
     const failure = handoff.failures[0] ?? '';
     push(
-      `Do not repeat the previous attempt (${failedAttempt.item.id}): ${truncate(failure, 180)}. Choose a different strategy.`,
+      `Do not repeat the previous attempt (${failedAttempt.item.id}): ${endSentence(truncate(failure, 180))} Choose a different strategy.`,
       'memory',
     );
   }
@@ -480,7 +479,7 @@ function buildApproach(input: {
   );
   if (canonicalDecision) {
     push(
-      `Route the change through the recorded canonical source rather than adding a parallel path: ${truncate(canonicalDecision.item.title, 160)}.`,
+      `Route the change through the recorded canonical source rather than adding a parallel path: ${endSentence(truncate(canonicalDecision.item.title, 160))}`,
       'memory',
     );
   }
@@ -490,20 +489,20 @@ function buildApproach(input: {
   );
   if (confirmedFinding) {
     push(
-      `Use the stored finding (${confirmedFinding.item.id}, ${confidenceLabel(confirmedFinding.item.confidence ?? 'suspected')}): ${truncate(confirmedFinding.item.title, 160)}.`,
+      `Use the stored finding (${confirmedFinding.item.id}, ${confidenceLabel(confirmedFinding.item.confidence ?? 'suspected')}): ${endSentence(truncate(confirmedFinding.item.title, 160))}`,
       'memory',
     );
   }
 
   const relevantConstraint = input.constraints.find((constraint) => constraint.severity === 'critical');
   if (relevantConstraint) {
-    push(`Keep this invariant intact: ${truncate(relevantConstraint.statement, 160)}.`, 'memory');
+    push(`Keep this invariant intact: ${endSentence(truncate(relevantConstraint.statement, 160))}`, 'memory');
   }
 
   const bugWithRepro = input.bugs.find((bug) => (bug.item.raw as { reproduction?: string | null }).reproduction);
   if (bugWithRepro) {
     const bug = bugWithRepro.item.raw as { id: string; title: string; reproduction: string | null };
-    push(`Reproduce first: ${truncate(bug.reproduction ?? bug.title, 180)}.`, 'memory');
+    push(`Reproduce first: ${endSentence(truncate(bug.reproduction ?? bug.title, 180))}`, 'memory');
   }
 
   // ---- Template steps by task type --------------------------------------
@@ -693,7 +692,7 @@ function buildReverseEngineering(input: {
 /** Detect conflicts between stored state and the repository as it is now. */
 function detectConflicts(input: AssembleBriefInput, latestHandoff: BriefAttempt | null): BriefWarning[] {
   const warnings: BriefWarning[] = [];
-  const { observation, previousHead, headRelation, commitsSincePrevious, clock } = input;
+  const { observation, previousHead, headRelation, commitsSincePrevious } = input;
   const relation = headRelation === 'same' ? 'unknown' : headRelation;
 
   if (latestHandoff?.head && observation?.head && latestHandoff.head !== observation.head) {

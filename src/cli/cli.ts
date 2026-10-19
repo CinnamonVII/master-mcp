@@ -9,7 +9,6 @@
 import { readFileSync, writeFileSync } from 'node:fs';
 import { MasterMcpService } from '../app/service.ts';
 import type { BugInput, FollowUpInput, TestRunInput, VerificationInput } from '../app/service.ts';
-import type { ProjectSnapshot } from '../domain/transfer.ts';
 import { validateSnapshot } from '../domain/transfer.ts';
 import { errorMessage, MasterMcpError } from '../util/errors.ts';
 import { VERSION } from '../version.ts';

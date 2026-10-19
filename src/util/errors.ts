@@ -38,23 +38,3 @@ export function errorMessage(error: unknown): string {
   return String(error);
 }
 
-/** Collect non-fatal problems found during a call (malformed config, git absent). */
-export class WarningCollector {
-  private readonly warnings: string[] = [];
-
-  add(message: string): void {
-    if (!this.warnings.includes(message)) this.warnings.push(message);
-  }
-
-  addAll(messages: readonly string[]): void {
-    for (const message of messages) this.add(message);
-  }
-
-  list(): string[] {
-    return [...this.warnings];
-  }
-
-  get size(): number {
-    return this.warnings.length;
-  }
-}

@@ -7,7 +7,7 @@
  * repository mappings, and finally a git remote match. A previously unknown
  * project is registered automatically so the first call already works.
  */
-import { existsSync, realpathSync } from 'node:fs';
+import { realpathSync } from 'node:fs';
 import { basename, resolve } from 'node:path';
 import type { Project, Repository, RepositoryObservation } from '../domain/models.ts';
 import type { Store } from '../store/store.ts';
@@ -449,9 +449,4 @@ async function finish(input: {
     createdRepository,
     warnings,
   };
-}
-
-/** True when a path exists and is a directory. */
-export function isDirectoryPath(path: string): boolean {
-  return existsSync(path);
 }

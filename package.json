@@ -5,7 +5,7 @@
   "type": "module",
   "license": "MIT",
   "engines": {
-    "node": ">=22.5.0"
+    "node": ">=22.13.0"
   },
   "bin": {
     "master-mcp": "dist/index.js"

@@ -13,11 +13,15 @@ import { newId } from '../util/ids.ts';
 /** Generous read bound: an export is a full dump, not a ranked query. */
 const EXPORT_LIMIT = 100_000;
 
-export function readSnapshot(store: Store, project: import('../domain/models.ts').Project): ProjectSnapshot {
+export function readSnapshot(
+  store: Store,
+  project: import('../domain/models.ts').Project,
+  exportedAt: string,
+): ProjectSnapshot {
   return {
     formatVersion: SNAPSHOT_FORMAT_VERSION,
     generator: 'master-mcp',
-    exportedAt: new Date().toISOString(),
+    exportedAt,
     project,
     repositories: store.listRepositories(project.id),
     tasks: store.listTasks(project.id, { limit: EXPORT_LIMIT }),
@@ -78,6 +82,37 @@ export function writeSnapshot(store: Store, snapshot: ProjectSnapshot, options: 
     if (!id) return null;
     return taskIdMap.get(id) ?? id;
   };
+
+  // Every other record id is referenced only within its own collection (a
+  // task dependency is the exception, handled above), but an id owned by a
+  // different project must still be re-issued: `INSERT OR REPLACE` would
+  // otherwise move that project's record to the imported one.
+  const idTakenElsewhere = (table: string, id: string): boolean => {
+    const row = db.prepare(`SELECT project_id FROM ${table} WHERE id = ?`).get(id) as
+      | { project_id: string }
+      | undefined;
+    return row !== undefined && row.project_id !== targetProjectId;
+  };
+  const collectRemap = (
+    table: 'decisions' | 'constraints' | 'bugs' | 'findings' | 'verifications' | 'handoffs',
+    kind: 'decision' | 'constraint' | 'bug' | 'finding' | 'verification' | 'handoff',
+    ids: readonly string[],
+  ): Map<string, string> => {
+    const map = new Map<string, string>();
+    for (const id of new Set(ids)) {
+      if (!idTakenElsewhere(table, id)) continue;
+      const replacementId = newId(kind);
+      map.set(id, replacementId);
+      remappedIds.push({ kind, from: id, to: replacementId });
+    }
+    return map;
+  };
+  const decisionIdMap = collectRemap('decisions', 'decision', snapshot.decisions.map((row) => row.id));
+  const constraintIdMap = collectRemap('constraints', 'constraint', snapshot.constraints.map((row) => row.id));
+  const bugIdMap = collectRemap('bugs', 'bug', snapshot.bugs.map((row) => row.id));
+  const findingIdMap = collectRemap('findings', 'finding', snapshot.findings.map((row) => row.id));
+  const verificationIdMap = collectRemap('verifications', 'verification', snapshot.verifications.map((row) => row.id));
+  const handoffIdMap = collectRemap('handoffs', 'handoff', snapshot.handoffs.map((row) => row.id));
 
   db.exec('BEGIN');
   try {
@@ -190,7 +225,7 @@ export function writeSnapshot(store: Store, snapshot: ProjectSnapshot, options: 
     written['decisions'] = 0;
     for (const decision of snapshot.decisions) {
       decisionStatement.run(
-        decision.id,
+        decisionIdMap.get(decision.id) ?? decision.id,
         targetProjectId,
         decision.statement,
         decision.rationale,
@@ -200,7 +235,7 @@ export function writeSnapshot(store: Store, snapshot: ProjectSnapshot, options: 
         arr(decision.files),
         arr(decision.commits),
         decision.status,
-        decision.supersededBy,
+        decision.supersededBy ? (decisionIdMap.get(decision.supersededBy) ?? decision.supersededBy) : null,
         decision.createdAt ?? options.now,
         decision.updatedAt ?? options.now,
       );
@@ -214,7 +249,7 @@ export function writeSnapshot(store: Store, snapshot: ProjectSnapshot, options: 
     written['constraints'] = 0;
     for (const constraint of snapshot.constraints) {
       constraintStatement.run(
-        constraint.id,
+        constraintIdMap.get(constraint.id) ?? constraint.id,
         targetProjectId,
         constraint.statement,
         constraint.subsystem,
@@ -236,7 +271,7 @@ export function writeSnapshot(store: Store, snapshot: ProjectSnapshot, options: 
     written['bugs'] = 0;
     for (const bug of snapshot.bugs) {
       bugStatement.run(
-        bug.id,
+        bugIdMap.get(bug.id) ?? bug.id,
         targetProjectId,
         bug.title,
         bug.severity,
@@ -263,7 +298,7 @@ export function writeSnapshot(store: Store, snapshot: ProjectSnapshot, options: 
     written['findings'] = 0;
     for (const finding of snapshot.findings) {
       findingStatement.run(
-        finding.id,
+        findingIdMap.get(finding.id) ?? finding.id,
         targetProjectId,
         finding.statement,
         arr(finding.evidence),
@@ -285,7 +320,7 @@ export function writeSnapshot(store: Store, snapshot: ProjectSnapshot, options: 
     written['verifications'] = 0;
     for (const verification of snapshot.verifications) {
       verificationStatement.run(
-        verification.id,
+        verificationIdMap.get(verification.id) ?? verification.id,
         targetProjectId,
         mapTask(verification.taskId),
         verification.method,
@@ -305,7 +340,7 @@ export function writeSnapshot(store: Store, snapshot: ProjectSnapshot, options: 
     written['handoffs'] = 0;
     for (const handoff of snapshot.handoffs) {
       handoffStatement.run(
-        handoff.id,
+        handoffIdMap.get(handoff.id) ?? handoff.id,
         targetProjectId,
         mapTask(handoff.taskId),
         handoff.summary,
@@ -407,10 +442,3 @@ export function reindexProject(store: Store, projectId: string): void {
   ).all(projectId) as Array<Record<string, SqlValue>>);
 }
 
-/** Count indexed rows for a project; used by diagnostics and tests. */
-export function indexedRows(store: Store, projectId: string): number {
-  const row = store.raw().prepare('SELECT COUNT(*) AS count FROM memory_fts WHERE project_id = ?').get(projectId) as
-    | { count: number }
-    | undefined;
-  return Number(row?.count ?? 0);
-}

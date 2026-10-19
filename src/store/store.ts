@@ -30,7 +30,7 @@ import type {
   VerificationResult,
   VerificationStatus,
 } from '../domain/models.ts';
-import { confidenceRank, severityWeight } from '../domain/vocabulary.ts';
+import { confidenceRank } from '../domain/vocabulary.ts';
 import { keywords, truncate } from '../util/text.ts';
 import { newId } from '../util/ids.ts';
 
@@ -1521,16 +1521,6 @@ export function buildFtsQuery(terms: readonly string[]): string {
     .slice(0, 24);
   if (cleaned.length === 0) return '""';
   return cleaned.map((term) => `"${term}"`).join(' OR ');
-}
-
-/** Sort helper: severity then recency, used by status and brief selection. */
-export function compareSeverityThenRecency(
-  a: { severity: Severity | null; createdAt: string },
-  b: { severity: Severity | null; createdAt: string },
-): number {
-  const severityDelta = severityWeight(b.severity ?? 'low') - severityWeight(a.severity ?? 'low');
-  if (severityDelta !== 0) return severityDelta;
-  return b.createdAt.localeCompare(a.createdAt);
 }
 
 export type { CommitInfo };

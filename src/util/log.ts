@@ -30,7 +30,3 @@ export const log = {
   warn: (message: string, detail?: unknown) => emit('warn', message, detail),
   error: (message: string, detail?: unknown) => emit('error', message, detail),
 };
-
-export function isDebugEnabled(): boolean {
-  return enabled;
-}

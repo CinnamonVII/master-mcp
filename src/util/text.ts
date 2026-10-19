@@ -216,21 +216,17 @@ export function approxTokens(text: string): number {
   return Math.ceil(text.length / 4);
 }
 
+/** End `text` with exactly one sentence period, collapsing whitespace as it goes. */
+export function endSentence(text: string): string {
+  const cleaned = text.replace(/\s+/g, ' ').trim();
+  if (!cleaned) return '';
+  return /[.!?…]$/.test(cleaned) ? cleaned : `${cleaned}.`;
+}
+
 /** Collapse whitespace and strip a trailing period, for list rendering. */
 export function tidy(text: string | null | undefined): string {
   if (!text) return '';
   return text.replace(/\s+/g, ' ').trim().replace(/\.$/, '');
-}
-
-/** Format a compact bullet list, or an empty string when there is nothing to show. */
-export function bullets(items: readonly string[]): string {
-  return items.map((item) => `- ${item}`).join('\n');
-}
-
-/** Case-insensitive substring test that tolerates undefined haystacks. */
-export function containsIgnoreCase(haystack: string | null | undefined, needle: string): boolean {
-  if (!haystack || !needle) return false;
-  return haystack.toLowerCase().includes(needle.toLowerCase());
 }
 
 /** Nearest match from a list of candidates for a free-text term, or undefined. */

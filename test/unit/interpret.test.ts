@@ -169,6 +169,13 @@ describe('integration: interpretTask', () => {
     assert.equal(interpret('Fix the check', { mode: 'deep' }).mode, 'deep');
     assert.equal(interpret('Fix the check', { mode: 'read_only' }).mode, 'read_only');
   });
+
+  it('an explicit re mode forces the reverse-engineering framing even for neutral wording', () => {
+    const result = interpret('Fix the check', { mode: 're' });
+    assert.equal(result.mode, 're');
+    assert.equal(result.reverseEngineering, true);
+    assert.equal(interpret('Fix the check').reverseEngineering, false);
+  });
 });
 
 describe('isReverseEngineeringTask', () => {

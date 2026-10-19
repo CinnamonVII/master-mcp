@@ -8,7 +8,7 @@ import { dirname, isAbsolute, join, resolve } from 'node:path';
 import type { Clock } from '../util/time.ts';
 import { isoNow } from '../util/time.ts';
 import { configError } from '../util/errors.ts';
-import { LATEST_VERSION, MIGRATIONS, type Migration } from './migrations.ts';
+import { MIGRATIONS, type Migration } from './migrations.ts';
 
 export const DEFAULT_DB_FILENAME = 'master-mcp.db';
 
